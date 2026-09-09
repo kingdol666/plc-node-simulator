@@ -46,19 +46,19 @@ const nodes = (await (await fetch('http://127.0.0.1:4010/api/nodes')).json()).da
   const pressure = decodeRegisters((await client.readHoldingRegisters(2, 2)).data as number[], 'float32', 'big')
   check('FC03 读 压力PV(40003 float32)', pressure >= 0 && pressure <= 2, `value=${pressure.toFixed(3)}MPa`)
 
-  // DCW 语义:FC16 写 SP=182 → 同址回读一致
-  const target = 182
+  // DCW 语义:FC16 写 SP → 同址回读一致(SP 取当前 PV +10:不论模拟器已运行多久,PV 都有上升空间)
+  const target = Math.round(pv + 10)
   const buf = Buffer.alloc(4)
   buf.writeFloatBE(target, 0)
   await client.writeRegisters(20, [buf.readUInt16BE(0), buf.readUInt16BE(2)])
   const readback = decodeRegisters((await client.readHoldingRegisters(20, 2)).data as number[], 'float32', 'big')
-  check('FC16 写 SP=182 → 同址回读一致', Math.abs(readback - target) < 0.01, `readback=${readback}`)
+  check('FC16 写 SP=PV+10 → 同址回读一致', Math.abs(readback - target) < 0.01, `readback=${readback}`)
 
-  // first-order 回灌:PV 应随 SP 收敛(等待 3s,一阶 τ=8s 后应显著爬升)
+  // first-order 回灌:PV 应随 SP 收敛(等待 3s;τ=8s 下 3s 收敛约 31% 间隙 ≈ +3.1℃,远超噪声)
   const pvBefore = pv
   await new Promise(r => setTimeout(r, 3000))
   const pvAfter = decodeRegisters((await client.readHoldingRegisters(0, 2)).data as number[], 'float32', 'big')
-  check('SP 回灌 → PV 一阶收敛趋势', pvAfter > pvBefore, `pv ${pvBefore.toFixed(1)} → ${pvAfter.toFixed(1)}(SP=182)`)
+  check('SP 回灌 → PV 一阶收敛趋势', pvAfter > pvBefore + 1, `pv ${pvBefore.toFixed(1)} → ${pvAfter.toFixed(1)}(SP=${target})`)
   await client.close()
 }
 

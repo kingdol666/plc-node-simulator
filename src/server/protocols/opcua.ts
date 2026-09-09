@@ -27,6 +27,11 @@ export async function startOpcUa(node: DeviceNode): Promise<ProtocolHandle> {
   const server = new OPCUAServer({
     port,
     hostname,
+    // 模拟器会被多个客户端(主项目连接池/测试/探针)反复拨入,默认每端点上限(10)会被
+    // 残留半开连接顶爆(表现为 "maximum number of connection has been reached"),放宽
+    maxConnectionsPerEndpoint: 256,
+    // 会话上限同步放宽(engine.serverCapabilities.maxSessions,默认很小,多客户端轮询即 BadTooManySessions)
+    serverCapabilities: { maxSessions: 512 } as never,
     buildInfo: { productName: `PLC-Simulator:${node.name}` },
     ...(userManager ? { userManager: userManager as never } : {}),
   })

@@ -26,16 +26,61 @@ Windows 注意:本机回环连接需 `NO_PROXY=127.0.0.1,localhost`(代理会劫
 
 每信号独立策略 + 故障注入 + 标定(`输出 = value × scale + offset`):
 
-- **策略**:constant / sine(正弦) / random-walk(随机游走+钳位) / ramp(斜坡+循环) / **first-order(一阶惯性工艺闭环,PV→SP 收敛,抄主项目 dev-plc-simulator 已验证动力学)** / expression(表达式,`[信号名]` 引用其他信号) / manual(手动覆写)
+- **策略**:constant / sine(正弦) / random-walk(随机游走+钳位) / ramp(斜坡+循环) / **first-order(一阶惯性工艺闭环,PV→SP 收敛,抄主项目 dev-plc-simulator 已验证动力学)** / expression(表达式,`[信号名]` 引用其他信号) / manual(手动覆写) / **hook(用户自定义数据产生器,见下节)**
+- **数据形态**:scalar(标量,默认)/ **vector(向量帧,≤4096 点)** / **image(图像帧,PNG 二进制直出)** —— 与主项目 v2 帧管线(daq_frames)对齐
 - **故障注入**:stuckAt 卡值 / spike 尖峰越限(触发主项目 daq.alarm) / drift 漂移 / disconnect 断链(端口关闭/HTTP 503,窗后自愈)
 - **SP→PV 联动**:SP 寄存器地址配 `writebackTarget` → 外部写 SP 同步更新目标回路的 first-order.sp(真实 PLC 控制语义)
+
+## hook:用户自定义数据产生器(代码动态注入)
+
+信号策略配 `{"kind":"hook","code":"…","timegapMs":2000}` 即可用 **JS 代码控制每一拍的数据怎么产生**:
+
+```jsonc
+// code 为 producer 函数体,可直接引用:now / dt / prev / state / vars / min / max / rand
+"code": "state.t = (state.t ?? 0) + dt; return prev + (sp(state) - prev) * 0.1"
+// return number            → 标量
+// return {points:[…]}      → vector 向量帧(如厚度轮廓)
+// return {png, width, height} → image 图像帧(base64 PNG)
+```
+
+- `state` 是该信号私有持久对象(跨拍保留)→ 可写滤波/积分/状态机等任意逻辑
+- `vars` 是同设备其他信号当前值 → 信号间联动
+- `timegapMs` 是发送节流(如 2000 = 每 2 秒发一次,期间保持)
+- 护栏:禁用 import/require/process/globalThis;编译结果按策略对象缓存
+
+## plant-model:挤出流延数字孪生物理引擎(cast-film-physics 预设)
+
+**所有 DAQ 值不再独立随机,而是从物理状态方程组积分产出** —— 数控调参后,数采按真实物理规律联动:
+
+```
+控制(6 DCW,五协议)                     物理状态(欧拉积分,可播种)               采集(7 DAQ)
+zone1/2/3 SP(MBTCP 40021/23/25) ─→ 加热区一阶惯性+区间热传导(τ=90s) ─→ 熔体温度(MBTCP 40001)
+螺杆转速 SP(OPC UA ns=2;s=AW.N.Sp)─→ Arrhenius 粘度 → 流量 → 泵送腔一阶  ─→ 熔体压力(OPC UA)
+牵引线速 SP(MQTT aw/sim/lineSp/set)→ 质量守恒 h=Q/(w·v·ρ) + 输送纯滞后 L/v─→ 平均膜厚(MQTT)
+模口间隙 SP(HTTP POST)           ─→ CCD 缺陷率/晶点(对 Tm 抛物线敏感)    ─→ 轮廓向量/CCD图像/缺陷率(HTTP)/晶点(RTU)
+```
+
+- 噪声全部走 mulberry32 可播种 PRNG(**同 seed 完全可复现**);真值(未加噪)与协议暴露值(加噪)双列 JSONL 落 `data/truth.jsonl` —— 评测用真值当 ground truth,Agent 只能看到加噪后的世界
+- `timeScale`(默认 6×)压缩热惯性等待;`dtMs` 积分步长;全部物理参数可配
+- REST:`GET /api/plant/state`(瞬时状态)、`GET /api/plant/truth`(真值流)、`POST /api/plant/phase`(warmup/steady/batch/disturb 工况打标 + 扰动注入 heaterDecay/feedTempStep/feedDriftPerMin)、`GET /api/plant/optimum`(**离线网格搜索最优窗口 W***,孪生独有 ground truth)
+- 物理一致性断言(`npm test`):阶跃收敛/幅值=解析解±2%/滞后反比/停加热压降先升后降/同 seed 复现/稳态代数解≡积分值
+
+## 命名场景(工况隔离管理)
+
+```bash
+curl -X PUT  http://127.0.0.1:4010/api/scenarios/批次A-稳产     # 保存当前全部配置(节点+plantModel)
+curl -X POST http://127.0.0.1:4010/api/scenarios/批次A-稳产/apply  # 一键切回(隔离恢复)
+curl -X GET  http://127.0.0.1:4010/api/scenarios               # 列表
+```
+
+每个场景是完整快照(设备+信号策略+协议映射+工艺模型参数),互不干扰;节点级启停 `POST /api/nodes/:id/start|stop` 随时可用。
 
 ## Web UI
 
 - 设备卡片:协议徽章/端点/实时值/迷你趋势,启停
 - 编辑器:通信配置 + 寄存器/变量/主题/端点映射表 + 信号策略参数 + 故障注入
 - 点击信号数值 → 手动覆写(模拟操作工设定)
-- 「薄膜产线预设」一键生成五协议模拟产线(信号语义对齐主项目 DAQ 模板)
+- 「薄膜产线预设」一键生成五协议模拟产线(信号语义对齐主项目 DAQ 模板);「挤出流延数字孪生」预设生成 6 DCW + 7 DAQ 物理联动产线
 - **对接导出**:每设备生成主项目 driverConfig JSON + curl(test-driver 两条),消除手工对照
 - 配置导入/导出 JSON(data/config.json 原子写,重启不丢)
 
@@ -55,7 +100,7 @@ NO_PROXY='*' AW_BASE=http://127.0.0.1:3001 node scripts/e2e-integration.mjs
 ## 自测
 
 ```bash
-npm test   # 引擎 19 + modbus 6 + opcua 4 + mqtt 3 + http 3 = 35 断言
+npm test   # 引擎 19 + plant-model 物理一致性 18 + modbus 6 + opcua 4 + mqtt 3 + http 3
 ```
 
 ## 端口汇总(全部可配,env)
@@ -67,10 +112,13 @@ UI/API `4010`(SIM_PORT)|modbus-tcp `16040`|modbus-rtu `15041`|opcua `5840`|内�
 ```
 src/server/
   index.ts            入口:h3(API+HTTP 端点+静态前端)+ WS + broker
-  api.ts              REST(设备 CRUD/启停/手动覆写/策略覆写/导出/预设)
+  api.ts              REST(设备 CRUD/启停/手动覆写/策略覆写/导出/预设/工况与真值/命名场景)
   store.ts            config.json 原子写
   runtime.ts          每设备 tick:信号推进 + WS 推送
-  engine/signals.ts   策略数学 + 故障注入 + 写回灌(纯函数)
+  engine/signals.ts   策略数学(含 hook)+ 故障注入 + 写回灌(纯函数)
+  engine/plant-model.ts 挤出流延物理引擎(状态方程/稳态解/W* 网格搜索,纯函数可播种)
+  engine/plant-runtime.ts 模型↔信号绑定执行层 + 真值 JSONL 双列导出
+  engine/png-enc.ts   最小 PNG 编码器(image 帧)
   engine/registers.ts 编码/解码(与主项目 decodeRegisters 对称)+ CRC16
   protocols/          modbus-tcp / modbus-rtu / opcua / mqtt / http-endpoint / mqtt-broker / registry
 web/                  Vue3 + Vite(dark 控制室主题,绿 #3fe4ab / 青 #41c8f4 / 深海军蓝)

@@ -1,18 +1,61 @@
 /**
- * REST API —— 设备 CRUD / 启停 / 手动覆写 / 对接导出 / 场景预设。
+ * REST API —— 设备 CRUD / 启停 / 手动覆写 / 对接导出 / 场景预设 /
+ * 工艺模型(plant-model:状态/真值/阶段/最优窗口) / 命名场景隔离管理。
  * 返回信封 {code, message, data}(与 AgentWorkShop apiClient 契约一致,便于复用其错误归一)。
  */
+import fs from 'node:fs'
+import path from 'node:path'
 import {
-  createRouter, defineEventHandler, readBody, getRouterParam, createError,
+  createRouter, defineEventHandler, readBody, getRouterParam, getQuery, createError,
 } from 'h3'
-import { getConfig, findNode, upsertNode, removeNode, saveConfig, genId } from './store'
+import { getConfig, findNode, upsertNode, removeNode, saveConfig, genId, DATA_DIR } from './store'
 import { startNode, stopNode, isRunning } from './runtime'
 import { startProtocol, stopProtocol, summaryOf } from './protocols/registry'
-import { applyPreset } from './presets'
-import type { SignalDef } from '../shared/types'
+import { applyPreset, presetList, replaceAll } from './presets'
+import {
+  plantRunning, plantSnapshot, readTruth, setPhase, startPlantModel,
+} from './engine/plant-runtime'
+import { gridSearchOptimum } from './engine/plant-model'
+import type { DeviceNode, PlantModelConfig, SimConfig, SignalDef } from '../shared/types'
 
 const ok = (data: unknown = null) => ({ code: 0, message: 'ok', data })
 const fail = (status: number, code: string, message: string) => createError({ statusCode: status, data: { code, message } })
+
+// ---------- 命名场景(隔离管理):data/scenarios/<name>.json = { name, savedAt, config } ----------
+
+const SCENARIO_DIR = path.join(DATA_DIR, 'scenarios')
+
+const scenarioFile = (name: string): string =>
+  path.join(SCENARIO_DIR, `${name.replace(/[^\w.-]/g, '_')}.json`)
+
+function listScenarios(): Array<{ name: string, savedAt: string, nodes: number, plant: boolean }> {
+  fs.mkdirSync(SCENARIO_DIR, { recursive: true })
+  return fs.readdirSync(SCENARIO_DIR).filter(f => f.endsWith('.json')).map((f) => {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(SCENARIO_DIR, f), 'utf-8')) as { name: string, savedAt: string, config: SimConfig }
+      return { name: j.name, savedAt: j.savedAt, nodes: j.config.nodes?.length ?? 0, plant: !!j.config.plantModel?.enabled }
+    }
+    catch {
+      return { name: f, savedAt: '?', nodes: 0, plant: false }
+    }
+  })
+}
+
+async function applyScenario(name: string, boot: (n: DeviceNode) => Promise<void>): Promise<SimConfig> {
+  const file = scenarioFile(name)
+  if (!fs.existsSync(file)) throw fail(404, 'NOT_FOUND', `场景不存在: ${name}`)
+  const j = JSON.parse(fs.readFileSync(file, 'utf-8')) as { name: string, config: SimConfig }
+  const cfg = getConfig()
+  cfg.plantModel = j.config.plantModel
+  cfg.activeScenario = j.name
+  await replaceAll(j.config.nodes ?? [])
+  startPlantModel()
+  for (const n of getConfig().nodes) {
+    if (n.enabled) await boot(n)
+  }
+  saveConfig()
+  return getConfig()
+}
 
 /** SP→PV 联动:信号值更新时,把引用它的映射(writebackTarget)目标回路的 first-order.sp 同步 */
 function linkSpTarget(node: NonNullable<ReturnType<typeof findNode>>, signalId: string, out: number): void {
@@ -177,7 +220,6 @@ export function createApi() {
 
   router.put('/config', defineEventHandler(async (event) => {
     const body = await readBody<{ nodes?: unknown[] }>(event) ?? {}
-    const { replaceAll } = await import('./presets')
     replaceAll((body.nodes ?? []) as never)
     return ok({ nodes: getConfig().nodes.length })
   }))
@@ -185,12 +227,69 @@ export function createApi() {
   router.post('/presets/:key', defineEventHandler(async (event) => {
     const key = getRouterParam(event, 'key')
     const created = await applyPreset(key ?? '', bootNode)
+    getConfig().activeScenario = undefined
+    saveConfig()
     return ok(created)
   }))
 
-  router.get('/presets', defineEventHandler(() => ok([
-    { key: 'film-line', name: '薄膜双拉产线(全协议,对齐主项目 DAQ 模板语义)' },
-  ])))
+  router.get('/presets', defineEventHandler(() => ok(presetList())))
+
+  // ---------- 工艺模型(plant-model):状态 / 真值流 / 工况阶段 / 离线最优窗口 ----------
+
+  router.get('/plant/state', defineEventHandler(() => ok(plantSnapshot())))
+
+  router.get('/plant/truth', defineEventHandler((event) => {
+    const q = getQuery(event)
+    const limit = Math.min(Math.max(Number(q.limit ?? 500), 1), 5000)
+    return ok({ running: plantRunning(), samples: readTruth(limit) })
+  }))
+
+  // 工况阶段切换(打标真值流;SP 变更走真实协议写,由脚本/Agent 驱动)
+  router.post('/plant/phase', defineEventHandler(async (event) => {
+    const body = await readBody<{ phase?: string, disturbances?: PlantModelConfig['disturbances'] }>(event) ?? {}
+    const valid = ['warmup', 'steady', 'batch', 'disturb']
+    if (!body.phase || !valid.includes(body.phase)) throw fail(400, 'BAD_INPUT', `phase 必填且 ∈ ${valid.join('/')}`)
+    const cfg = setPhase(body.phase as PlantModelConfig['phase'], body.disturbances)
+    if (!cfg) throw fail(400, 'NO_PLANT', '工艺模型未配置(需 cast-film-physics 预设或 plantModel 配置)')
+    return ok(plantSnapshot())
+  }))
+
+  // 离线稳态最优窗口 W*(网格搜索;ground truth,评测基准)
+  router.get('/plant/optimum', defineEventHandler(() => {
+    const cfg = getConfig().plantModel
+    if (cfg?.optimum) return ok(cfg.optimum)
+    const optimum = gridSearchOptimum(cfg?.params)
+    if (cfg) { cfg.optimum = optimum; saveConfig() }
+    return ok(optimum)
+  }))
+
+  // ---------- 命名场景:保存当前全部配置(节点+工艺模型)为可复用工况 ----------
+
+  router.get('/scenarios', defineEventHandler(() => ok(listScenarios())))
+
+  router.put('/scenarios/:name', defineEventHandler(async (event) => {
+    const name = getRouterParam(event, 'name') ?? ''
+    if (!/^[\w.-]{1,64}$/.test(name)) throw fail(400, 'BAD_INPUT', '场景名限字母数字-_.,长度 1~64')
+    fs.mkdirSync(SCENARIO_DIR, { recursive: true })
+    const payload = { name, savedAt: new Date().toISOString(), config: getConfig() }
+    fs.writeFileSync(scenarioFile(name), JSON.stringify(payload, null, 2), 'utf-8')
+    getConfig().activeScenario = name
+    saveConfig()
+    return ok({ name, nodes: getConfig().nodes.length })
+  }))
+
+  router.post('/scenarios/:name/apply', defineEventHandler(async (event) => {
+    const name = getRouterParam(event, 'name') ?? ''
+    const cfg = await applyScenario(name, bootNode)
+    return ok({ name, nodes: cfg.nodes.length, plant: !!cfg.plantModel?.enabled })
+  }))
+
+  router.delete('/scenarios/:name', defineEventHandler((event) => {
+    const file = scenarioFile(getRouterParam(event, 'name') ?? '')
+    if (!fs.existsSync(file)) throw fail(404, 'NOT_FOUND', '场景不存在')
+    fs.unlinkSync(file)
+    return ok()
+  }))
 
   // 对接导出:生成主项目 /daq 添加节点所需 driverConfig + curl
   router.get('/nodes/:id/export', defineEventHandler((event) => {

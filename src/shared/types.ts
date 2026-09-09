@@ -19,6 +19,20 @@ export type SignalStrategy =
   | { kind: 'first-order', initial: number, tauMs: number, sp: number, noise: number }
   | { kind: 'expression', expr: string }
   | { kind: 'manual', value: number }
+  /**
+   * hook:用户自定义数据产生器(代码动态注入)。
+   * code 是 producer 函数体,每拍(或满足 timegapMs 节流)执行,可直接引用:
+   *   now(时间戳) dt(拍间隔ms) prev(上一拍值) state(私有持久对象)
+   *   vars(同设备其他信号值) min/max(量程) rand(随机源)
+   *   return number                  → 标量值
+   *        | { points: number[] }    → vector 向量帧(≤4096 点)
+   *        | { png: string, width?, height? } → image 帧(png 为 base64)
+   * state 跨拍保留,可实现滤波/积分/缓存的任意逻辑。
+   */
+  | { kind: 'hook', code: string, timegapMs?: number }
+
+/** 信号数据形态(主项目 v2 帧管线对接:vector/image 走 daq_frames,不走标量库) */
+export type SignalFormat = 'scalar' | 'vector' | 'image'
 
 /** 故障注入(可叠加) */
 export interface FaultInjection {
@@ -46,6 +60,10 @@ export interface SignalDef {
   /** 标定:输出 = value × scale + offset(与主项目 DataTransform 同约定) */
   scale?: number
   offset?: number
+  /** 数据形态(缺省 scalar;vector/image 由 hook 策略或 plantModel 产出) */
+  format?: SignalFormat
+  /** 工艺模型输出绑定:本信号的值由 plant-model 状态覆写(模型输出名,如 meltTemp) */
+  plantBinding?: string
   faults?: FaultInjection
   /** 运行时状态(不持久化) */
   runtime?: SignalRuntime
@@ -53,12 +71,18 @@ export interface SignalDef {
 
 export interface SignalRuntime {
   value: number
-  /** random-walk/ramp/first-order 内部游标 */
+  /** random-walk/ramp/first-order 内部游标;hook 策略复用为上次产生时间戳 */
   cursor?: number
+  /** hook 策略:上一拍时间戳(算 dt 用) */
+  prevTick?: number
   /** 上次 tick 时间戳 */
   lastTick?: number
   spikeUntil?: number
   disconnectUntil?: number
+  /** vector 形态:最近一帧点列 */
+  vector?: number[]
+  /** image 形态:最近一帧(base64 png + 尺寸) */
+  image?: { png: string, width: number, height: number }
   /** 环形历史(前端趋势) */
   hist?: number[]
 }
@@ -102,8 +126,10 @@ export interface MqttTopicMap {
 export interface HttpPathMap {
   path: string
   signalId: string
-  /** 响应模板:'${value}' 纯数字文本,或 JSON 如 '{"value":${value}}' */
+  /** 响应模板:'${value}' 纯数字文本,或 JSON 如 '{"value":${value}}';vector 支持 ${points},image 直出 PNG 二进制 */
   responseTemplate?: string
+  /** 可写控制端点:接受 POST {value}(主项目 http DCW 驱动语义),写入回灌信号 */
+  writable?: boolean
 }
 
 /** 虚拟设备节点 */
@@ -146,6 +172,126 @@ export interface DeviceNode {
 
 export interface SimConfig {
   nodes: DeviceNode[]
+  /** 工艺模型(数字孪生物理引擎;单产线级,跨设备联动) */
+  plantModel?: PlantModelConfig
+  /** 当前激活的命名场景(隔离管理用;仅元数据) */
+  activeScenario?: string
+}
+
+// ============================================================
+// plant-model:挤出流延薄膜产线物理模型(数字孪生试验台)
+// ============================================================
+
+export type PlantPhase = 'warmup' | 'steady' | 'batch' | 'disturb'
+
+export type PlantControlKey = 'zone1' | 'zone2' | 'zone3' | 'screw' | 'lineSpeed' | 'dieGap'
+
+export type PlantOutputKey =
+  | 'meltTemp'
+  | 'meltPressure'
+  | 'filmThickness'
+  | 'profile'
+  | 'defectRate'
+  | 'defectImage'
+  | 'gels'
+
+export interface PlantBinding {
+  nodeId: string
+  signalId: string
+}
+
+export interface PlantDisturbances {
+  /** 加热器效率衰减 0~1(1=正常;0.9 = 加热能力 -10%,模拟设备老化) */
+  heaterDecay?: number
+  /** 进料温度阶跃(℃,叠加在 zone1 有效设定上) */
+  feedTempStep?: number
+  /** 进料温度慢漂移(℃/min,随机游走) */
+  feedDriftPerMin?: number
+}
+
+export interface PlantParams {
+  /** 加热区时间常数(s) */
+  tauZone: number
+  /** 区间热传导系数 0~1 */
+  kHeat: number
+  /** 熔体输送纯滞后(s) */
+  tauMelt: number
+  /** Arrhenius 粘度指数(K) */
+  arrheniusB: number
+  /** 参考 粘度(Pa·s)/温度(K) */
+  mu0: number
+  tRef: number
+  /** 流量系数(kg/min 每 rpm) */
+  flowK: number
+  /** 泵送增益(kg/min 每 MPa)——P = Q/Kp */
+  pumpK: number
+  /** 泵送腔时间常数(s) */
+  tauP: number
+  /** 模口宽度(m) */
+  dieWidth: number
+  /** 模口到测厚仪距离(m);厚度纯滞后 = L/v */
+  gaugeDistance: number
+  /** 固化膜密度(kg/m³) */
+  filmDensity: number
+  /** 缺感参考温度(℃)——缺陷率最低点 */
+  defectT: number
+  /** 名义模口间隙(mm) */
+  dieGapRef: number
+  /** 传感器噪声 σ:温度/压力/厚度/缺陷/晶点 */
+  noiseTemp: number
+  noisePressure: number
+  noiseThickness: number
+  noiseDefect: number
+  noiseGels: number
+}
+
+/** 稳态最优窗口(离线网格搜索产物,ground truth) */
+export interface PlantOptimum {
+  zoneTemp: number
+  screw: number
+  lineSpeed: number
+  meltTemp: number
+  pressure: number
+  thickness: number
+  defect: number
+  score: number
+  computedAt: string
+}
+
+export interface PlantModelConfig {
+  enabled: boolean
+  /** 确定性噪声种子(可复现实验) */
+  seed: number
+  /** 积分步长(ms) */
+  dtMs: number
+  /** 时间加速倍率(1 = 实时物理;实验用 4~8 压缩收敛等待) */
+  timeScale: number
+  /** 控制输入绑定(DCW 写入的 SP 信号) */
+  controls: Record<PlantControlKey, PlantBinding>
+  /** 模型输出绑定(DAQ 采集信号,模型每拍覆写) */
+  outputs: Partial<Record<PlantOutputKey, PlantBinding>>
+  /** 物理参数(缺省用文献典型值) */
+  params?: Partial<PlantParams>
+  /** 当前工况阶段(脚本驱动,真值流打标) */
+  phase: PlantPhase
+  /** 扰动注入(加热衰减/进料阶跃/漂移) */
+  disturbances: PlantDisturbances
+  /** 真值/暴露双列 JSONL 导出(评测 ground truth) */
+  truthExport?: boolean
+  /** 离线稳态最优窗口(网格搜索缓存;null = 未计算) */
+  optimum?: PlantOptimum | null
+}
+
+/** plant-model 单步真值快照(JSONL 一行) */
+export interface PlantTruthSample {
+  t: string
+  phase: PlantPhase
+  /** 控制输入(工程量) */
+  sp: { zone1: number, zone2: number, zone3: number, screw: number, lineSpeed: number, dieGap: number }
+  /** 物理真值(未加噪,评测用) */
+  truth: { zoneTemps: [number, number, number], meltTemp: number, pressure: number, flow: number, thickness: number, defect: number, gels: number, viscosity: number, transportDelayS: number }
+  /** 协议暴露值(加噪后,Agent 看到的世界) */
+  exposed: { meltTemp: number, pressure: number, thickness: number, defect: number, gels: number }
 }
 
 /** WS 帧 */

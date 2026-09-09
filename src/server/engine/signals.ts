@@ -144,6 +144,68 @@ export function tickExpressionSignal(sig: SignalDef, vars: Record<string, number
   return rt.value
 }
 
+// ============================================================
+// hook 策略:用户自定义数据产生器(代码动态注入)
+// ============================================================
+
+/** 编译缓存:code → Function(配置对象被替换后自然失效,WeakMap 不驻留) */
+const hookCache = new WeakMap<object, (ctx: Record<string, unknown>) => unknown>()
+
+function compileHook(sig: SignalDef): (now: number, dt: number, prev: number, state: Record<string, unknown>, vars: Record<string, number>, min: number, max: number, rand: () => number) => unknown {
+  const s = sig.strategy as { kind: 'hook', code: string }
+  const cached = hookCache.get(s)
+  if (cached) return cached as never
+  if (typeof s.code !== 'string' || s.code.length > 20_000) throw new Error('hook.code 缺失或超长(>20k)')
+  // producer 函数体:return 数据即可;禁 import/process/require(本地模拟工具的护栏)
+  if (/\b(import|require|process|globalThis)\b/.test(s.code)) throw new Error('hook.code 含禁用标识符(import/require/process/globalThis)')
+  const fn = new Function('now', 'dt', 'prev', 'state', 'vars', 'min', 'max', 'rand', `"use strict";\n${s.code}`) as never
+  hookCache.set(s, fn)
+  return fn
+}
+
+/**
+ * hook 策略推进:每拍调用 producer;timegapMs 节流(未到间隔保持上一拍输出)。
+ * 返回 number → 标量;{points:[…]} → vector 帧;{png,width,height} → image 帧。
+ * producer 体内可直接引用 now/dt/prev/state/vars/min/max/rand(参数解构作用域)。
+ */
+export function tickHookSignal(sig: SignalDef, vars: Record<string, number>, now: number): number {
+  const rt = sig.runtime!
+  const s = sig.strategy as { kind: 'hook', code: string, timegapMs?: number, state?: Record<string, unknown> }
+  rt.lastTick = now
+  if (!s.state) s.state = {}
+  const gap = Math.max(s.timegapMs ?? 0, 0)
+  if (gap > 0 && typeof rt.cursor === 'number' && now - rt.cursor < gap) {
+    return rt.value // 节流窗内:保持上一拍
+  }
+  rt.cursor = now
+  const fn = compileHook(sig)
+  const dt = rt.prevTick ? Math.max(now - rt.prevTick, 0) : 0
+  rt.prevTick = now
+  const out = fn(now, dt, rt.value, s.state, vars, sig.min ?? 0, sig.max ?? 100, Math.random) as unknown
+  if (typeof out === 'number' && Number.isFinite(out)) {
+    const { value } = applyFaults(sig, out, now)
+    rt.value = Number((value * (sig.scale ?? 1) + (sig.offset ?? 0)).toFixed(sig.decimals ?? 3))
+  }
+  else if (out && typeof out === 'object') {
+    const o = out as { points?: unknown, png?: unknown, width?: unknown, height?: unknown, value?: unknown }
+    if (Array.isArray(o.points)) {
+      rt.vector = (o.points as unknown[]).map(Number).filter(Number.isFinite).slice(0, 4096)
+      const avg = rt.vector.reduce((a, b) => a + b, 0) / Math.max(rt.vector.length, 1)
+      rt.value = Number(avg.toFixed(sig.decimals ?? 3))
+    }
+    else if (typeof o.png === 'string') {
+      rt.image = { png: o.png, width: Number(o.width ?? 0) || 0, height: Number(o.height ?? 0) || 0 }
+      rt.value = Number(o.value ?? rt.value ?? 0)
+    }
+    else if (Number.isFinite(Number(o.value))) {
+      rt.value = Number(Number(o.value).toFixed(sig.decimals ?? 3))
+    }
+  }
+  rt.hist!.push(rt.value)
+  if (rt.hist!.length > 60) rt.hist!.shift()
+  return rt.value
+}
+
 /**
  * 外部写回灌(协议写到达时统一入口):first-order 改 sp(闭环),其余策略改目标值;
  * manual/constant 立即落到 runtime.value(DCW 写后同址回读一致依赖此语义)。

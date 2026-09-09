@@ -16,8 +16,9 @@ import { startAll, stopAll } from './runtime'
 import { stopAllProtocols } from './protocols/registry'
 import { createApi, bootNode } from './api'
 import { addClient } from './bus'
-import { serveById } from './protocols/http-endpoint'
+import { serveById, writeHttpControl } from './protocols/http-endpoint'
 import { startBroker } from './protocols/mqtt-broker'
+import { startPlantModel, stopPlantModel } from './engine/plant-runtime'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.SIM_PORT ?? 4010)
@@ -38,13 +39,26 @@ async function main(): Promise<void> {
   app.use('/api', router as never)
 
   // HTTP 协议端点:/sim-http/{deviceId}{path}(主项目 http 驱动拨入)。
+  // GET = 采样(vector JSON / image PNG / 标量);POST = writable 控制端点。
   // 兜底 handler(注册序在 /api 之后),不依赖 h3 通配挂载语义。
-  app.use(defineEventHandler((event) => {
+  const HTTP_MIME: Record<string, string> = { json: 'application/json', text: 'text/plain', png: 'image/png' }
+  app.use(defineEventHandler(async (event) => {
     const m = event.path.match(/^\/sim-http\/([^/?]+)(\/[^?]*)/)
     if (!m) return // 交还后续 handler(静态/404)
     const [, deviceId, p] = m
-    const r = serveById(deviceId!, p!)
-    setResponseHeader(event, 'content-type', r.body.startsWith('{') ? 'application/json' : 'text/plain')
+    let r
+    if (event.node.req.method === 'POST') {
+      const body = await new Promise<string>((resolve) => {
+        const chunks: Buffer[] = []
+        event.node.req.on('data', (c: Buffer) => chunks.push(c))
+        event.node.req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')))
+      })
+      r = writeHttpControl(deviceId!, p!, body)
+    }
+    else {
+      r = serveById(deviceId!, p!)
+    }
+    setResponseHeader(event, 'content-type', HTTP_MIME[r.contentType]!)
     event.node.res.statusCode = r.status
     return r.body
   }))
@@ -87,16 +101,18 @@ async function main(): Promise<void> {
     server.listen(PORT, () => resolve())
   })
 
-  // 恢复全部 enabled 设备
+  // 恢复全部 enabled 设备 + 工艺模型
   for (const node of loadConfig().nodes) {
     if (node.enabled) await bootNode(node)
   }
+  startPlantModel()
 
   console.log(`[plc-node-simulator] 就绪 http://127.0.0.1:${PORT}(WS /ws;HTTP 端点 /sim-http/{deviceId}/**)`)
 
   const shutdown = async (): Promise<void> => {
     console.log('[plc-node-simulator] 退出中…')
     stopAll()
+    stopPlantModel()
     await stopAllProtocols()
     server.close(() => process.exit(0))
     setTimeout(() => process.exit(0), 2000)

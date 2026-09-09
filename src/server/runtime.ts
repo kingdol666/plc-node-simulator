@@ -3,7 +3,7 @@
  * 协议端点(Modbus/OPC UA 响应读请求;MQTT/HTTP 发布)按需读 runtime.value。
  */
 import type { DeviceNode } from '../shared/types'
-import { tickSignal, tickExpressionSignal } from './engine/signals'
+import { tickSignal, tickExpressionSignal, tickHookSignal } from './engine/signals'
 import { maybeArmDisconnect } from './engine/faults'
 import { broadcast } from './bus'
 import { findNode, getConfig } from './store'
@@ -17,22 +17,26 @@ export function signalValues(node: DeviceNode): Record<string, number> {
   return out
 }
 
-/** 推进设备内全部信号一拍(表达式信号最后处理,可引用其他信号) */
+/** 推进设备内全部信号一拍(表达式/hook 信号最后处理,可引用其他信号;plant 绑定信号由模型接管) */
 export function tickNode(node: DeviceNode, now = Date.now()): void {
   if (!node.enabled) return
   maybeArmDisconnect(node)
   const changed: Array<{ id: string, name: string, value: number, unit?: string }> = []
-  const plain = (node.signals ?? []).filter(s => s.strategy.kind !== 'expression')
-  const exprs = (node.signals ?? []).filter(s => s.strategy.kind === 'expression')
+  const plain = (node.signals ?? []).filter(s =>
+    !s.plantBinding && s.strategy.kind !== 'expression' && s.strategy.kind !== 'hook')
+  const computed = (node.signals ?? []).filter(s =>
+    !s.plantBinding && (s.strategy.kind === 'expression' || s.strategy.kind === 'hook'))
   for (const s of plain) {
     if (!s.runtime) s.runtime = { value: 0, hist: [] }
     const v = tickSignal(s, now)
     changed.push({ id: s.id, name: s.name, value: v, unit: s.unit })
   }
   const vars = signalValues(node)
-  for (const s of exprs) {
+  for (const s of computed) {
     if (!s.runtime) s.runtime = { value: 0, hist: [] }
-    const v = tickExpressionSignal(s, vars, now)
+    const v = s.strategy.kind === 'hook'
+      ? tickHookSignal(s, vars, now)
+      : tickExpressionSignal(s, vars, now)
     changed.push({ id: s.id, name: s.name, value: v, unit: s.unit })
     vars[s.name] = v
   }
