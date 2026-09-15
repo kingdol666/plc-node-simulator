@@ -158,7 +158,10 @@ export interface DeviceNode {
     /** mqtt:主动发布 */
     brokerUrl?: string
     topics?: MqttTopicMap[]
+    /** mqtt:命令主题(主项目 DCW 下发设定值;payload {"setpoint":v} 或纯数字) */
     commandTopic?: string
+    /** mqtt:命令主题回灌的目标信号 id */
+    commandSignalId?: string
     /** http:GET 端点(挂在模拟器 UI 同端口) */
     paths?: HttpPathMap[]
   }

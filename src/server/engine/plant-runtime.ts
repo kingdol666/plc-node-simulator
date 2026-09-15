@@ -160,18 +160,20 @@ function stepOnce(): void {
   }
 }
 
-/** 启动物理模型(按 config.plantModel;未启用则停止) */
-export function startPlantModel(): void {
+/** 启动物理模型(按 config.plantModel;未启用则停止)。
+ *  warm=true 时热态复位(tz=标称工艺温度)→ 免去冷态预热;缺省冷态(与既有行为一致)。 */
+export function startPlantModel(warm = false): void {
   stopPlantModel()
   const cfg = getConfig().plantModel
   if (!cfg?.enabled) return
   model = new CastFilmModel(cfg.params, cfg.seed)
+  model.reset(cfg.seed, /* cold = */ !warm)
   if (cfg.truthExport) openTruthStream(cfg)
   timer = setInterval(stepOnce, Math.max(cfg.dtMs, 100))
   timer.unref?.()
   // 启动即推一拍:绑定信号立刻有值
   stepOnce()
-  console.log(`[plant-model] 已启用 cast-film 物理引擎 seed=${cfg.seed} dt=${cfg.dtMs}ms ×${cfg.timeScale} 阶段=${cfg.phase}`)
+  console.log(`[plant-model] 已启用 cast-film 物理引擎 seed=${cfg.seed} dt=${cfg.dtMs}ms ×${cfg.timeScale} 阶段=${cfg.phase}${warm ? ' 热态' : ' 冷态'}`)
 }
 
 export function stopPlantModel(): void {

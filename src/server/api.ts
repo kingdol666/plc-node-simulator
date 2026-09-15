@@ -263,6 +263,29 @@ export function createApi() {
     return ok(optimum)
   }))
 
+  /**
+   * 物理模型复位 —— 多 seed 可复现 benchmark 的前提。
+   * body: { seed?, phase?, disturbances?, params? }。重置 RNG 与初始状态并重开真值流;
+   * 仅当 params 变化时作废 W*(W* 是稳态网格解,与 RNG seed 无关)。
+   */
+  router.post('/plant/reset', defineEventHandler(async (event) => {
+    const body = await readBody<{ seed?: number, phase?: string, disturbances?: PlantModelConfig['disturbances'], params?: Record<string, number>, warm?: boolean }>(event) ?? {}
+    const cfg = getConfig().plantModel
+    if (!cfg) throw fail(400, 'NO_PLANT', '工艺模型未配置(需 cast-film-physics 预设)')
+    if (Number.isFinite(Number(body.seed))) cfg.seed = Number(body.seed)
+    if (body.phase && ['warmup', 'steady', 'batch', 'disturb'].includes(body.phase)) {
+      cfg.phase = body.phase as PlantModelConfig['phase']
+    }
+    if (body.disturbances) cfg.disturbances = { ...(cfg.disturbances ?? {}), ...body.disturbances }
+    if (body.params) {
+      cfg.params = { ...(cfg.params ?? {}), ...body.params } as PlantModelConfig['params']
+      delete (cfg as { optimum?: unknown }).optimum
+    }
+    saveConfig()
+    startPlantModel(body.warm === true)
+    return ok(plantSnapshot())
+  }))
+
   // ---------- 命名场景:保存当前全部配置(节点+工艺模型)为可复用工况 ----------
 
   router.get('/scenarios', defineEventHandler(() => ok(listScenarios())))
@@ -301,17 +324,51 @@ export function createApi() {
   return router
 }
 
+/**
+ * 从报文模板推导 jsonPath —— 即 `${value}` 占位符实际所处的键路径。
+ * 例:'{"data":{"thick":${value}}}' → 'data.thick';'{"value":${value}}' → 'value'。
+ * 报文非 JSON(纯数字文本)或推导失败 → undefined(无需提取)。
+ *
+ * 修复动机:此前 jsonPath 被硬编码为 'data.temp' / 'data.value',只对 film-line 预设成立;
+ * cast-film-physics 预设的 mqtt('{"data":{"thick":…}}')与 http('/api/defect','{"value":…}')
+ * 因此导出**不可直接使用**的驱动配置,主项目按其采样必然失败(无样本落库)。
+ */
+function jsonPathFromTemplate(template: string | undefined, placeholder = 'value'): string | undefined {
+  if (!template || !template.includes('{')) return undefined
+  const SENT = '__AW_SENTINEL__'
+  const filled = template
+    .replace(new RegExp(`\\$\\{${placeholder}\\}`, 'g'), `"${SENT}"`)
+    .replace(/\$\{[a-zA-Z0-9_]+\}/g, '0')
+  try {
+    const parsed = JSON.parse(filled) as unknown
+    const path: string[] = []
+    const walk = (v: unknown): boolean => {
+      if (v === SENT) return true
+      if (v && typeof v === 'object') {
+        for (const k of Object.keys(v as Record<string, unknown>)) {
+          path.push(k)
+          if (walk((v as Record<string, unknown>)[k])) return true
+          path.pop()
+        }
+      }
+      return false
+    }
+    return walk(parsed) && path.length ? path.join('.') : undefined
+  }
+  catch { return undefined }
+}
+
 /** 生成主项目对接配置(每个信号一条:driver + driverConfig + 建议采样周期) */
 function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
   const cfg = node.config
-  const items: Array<{ signal: string, driver: string, driverConfig: Record<string, unknown>, curl: string }> = []
-  const push = (signal: string, driver: string, driverConfig: Record<string, unknown>) => {
+  const items: Array<{ signal: string, driver: string, format?: string, driverConfig: Record<string, unknown>, curl: string }> = []
+  const push = (signal: string, driver: string, driverConfig: Record<string, unknown>, format?: string) => {
     const curl = [
       `curl -s -X POST http://127.0.0.1:3021/api/workshop/daq/test-driver`,
       `  -H 'content-type: application/json'`,
       `  -d '${JSON.stringify({ driver, driverConfig })}'`,
     ].join('\\n')
-    items.push({ signal, driver, driverConfig, curl })
+    items.push({ signal, driver, ...(format ? { format } : {}), driverConfig, curl })
   }
   for (const s of node.signals ?? []) {
     if (node.protocol === 'modbus-tcp' || node.protocol === 'modbus-rtu') {
@@ -320,26 +377,44 @@ function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
       push(s.name, node.protocol, {
         host: '127.0.0.1', port: cfg.port, unitId: cfg.unitId ?? 1,
         register: m.address, registerType: m.area, dataType: m.dataType, byteOrder: m.byteOrder,
-      })
+      }, s.format)
     }
     else if (node.protocol === 'opcua') {
       const v = (cfg.opcVars ?? []).find(x => x.signalId === s.id)
       if (!v) continue
-      push(s.name, 'opcua', { endpoint: `opc.tcp://127.0.0.1:${cfg.port ?? 4840}`, nodeId: v.nodeId })
+      push(s.name, 'opcua', { endpoint: `opc.tcp://127.0.0.1:${cfg.port ?? 4840}`, nodeId: v.nodeId }, s.format)
     }
     else if (node.protocol === 'mqtt') {
+      // 命令主题(设定值):本信号是 commandSignalId 时导出**可写**配置
+      // (平台 DCW 经 mqtt publish {"setpoint":v} 下发,模拟器订阅后回灌信号)。
+      // 修复动因:此前只遍历 topics(只读遥测),commandTopic 声明了却从不导出 →
+      // cast-film 的 lineSpeedSP 拿不到驱动配置,该执行器在主项目侧"根本不存在"。
+      if (cfg.commandTopic && cfg.commandSignalId === s.id) {
+        push(s.name, 'mqtt', {
+          host: '127.0.0.1', port: Number(new URL(cfg.brokerUrl ?? 'mqtt://127.0.0.1:18830').port ?? 1883),
+          topic: cfg.commandTopic, jsonKey: 'setpoint',
+        }, s.format)
+        continue
+      }
       const t = (cfg.topics ?? []).find(x => x.signalId === s.id)
       if (!t) continue
-      push(s.name, 'mqtt', { host: '127.0.0.1', port: Number(new URL(cfg.brokerUrl ?? 'mqtt://127.0.0.1:18830').port ?? 1883), topic: t.topic, jsonPath: 'data.temp' })
+      const jp = jsonPathFromTemplate(t.payloadTemplate)
+      push(s.name, 'mqtt', {
+        host: '127.0.0.1', port: Number(new URL(cfg.brokerUrl ?? 'mqtt://127.0.0.1:18830').port ?? 1883),
+        topic: t.topic, ...(jp ? { jsonPath: jp } : {}),
+      }, s.format)
     }
     else if (node.protocol === 'http') {
       const p = (cfg.paths ?? []).find(x => x.signalId === s.id)
       if (!p) continue
+      // 标量取 ${value} 所在键；**向量轮廓取 ${points}**——否则向量端点会被主项目按标量读，
+      // 帧永远落不了库（实测：cast-film 的 /api/profile 被读成 value 标量，vector 帧 0 条）。
+      const jp = jsonPathFromTemplate(p.responseTemplate, s.format === 'vector' ? 'points' : 'value')
       push(s.name, 'http', {
         url: `http://127.0.0.1:${process.env.SIM_PORT ?? 4010}/sim-http/${node.id}${p.path}`,
         // 主项目 http 驱动要求 jsonPath 提取(JSON 报文);纯数字文本则无需
-        jsonPath: (p.responseTemplate ?? '').includes('{') ? 'data.value' : undefined,
-      })
+        ...(jp ? { jsonPath: jp } : {}),
+      }, s.format)
     }
   }
   return { device: { id: node.id, name: node.name, protocol: node.protocol }, items }
