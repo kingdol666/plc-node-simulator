@@ -1,7 +1,7 @@
 {
   "name": "plc-node-simulator",
   "version": "0.1.0",
-  "description": "PLC 节点真实模拟器 —— 多协议虚拟工业设备(Modbus TCP/RTU · OPC UA · MQTT · HTTP),真实物理设备数据通信替身",
+  "description": "Multi-protocol virtual industrial device (Modbus TCP/RTU · OPC UA · MQTT · HTTP) — a stand-in for a real PLC that emits physical-device signals over real protocol stacks",
   "main": "index.js",
   "directories": {
     "test": "tests"
@@ -20,9 +20,17 @@
     "build": "vite build web",
     "web:dev": "vite web"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "plc",
+    "simulator",
+    "modbus",
+    "opcua",
+    "mqtt",
+    "industrial-automation",
+    "digital-twin"
+  ],
+  "author": "kingdol (kingdol666)",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "private": true,
   "engines": {
