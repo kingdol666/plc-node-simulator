@@ -165,8 +165,16 @@ export async function startModbusRtu(node: DeviceNode): Promise<ProtocolHandle> 
   return {
     close: async () => {
       clearInterval(guard)
-      server.close(() => {})
-      closeAll()
+      // 等 close 回调(端口真正释放)再返回,否则预设切换立刻重绑同端口会 EADDRINUSE
+      await new Promise<void>((resolve) => {
+        let done = false
+        const finish = () => { if (!done) { done = true; resolve() } }
+        try {
+          closeAll()
+          server.close(() => finish())
+          setTimeout(finish, 2500)
+        } catch { finish() }
+      })
     },
     summary: () => ({ protocol: 'modbus-rtu', host, port, unitId, mode, signals: node.signals.length, listening: server.listening }),
   }

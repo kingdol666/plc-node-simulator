@@ -82,10 +82,16 @@ export async function startModbusTcp(node: DeviceNode): Promise<ProtocolHandle> 
       clearInterval(guard)
       const cur = live.get(node.id)
       if (cur) {
-        try {
-          cur.close(() => {})
-        }
-        catch { /* 已关 */ }
+        // 等 close 回调(端口真正释放)再返回,否则预设切换立刻重绑同端口会 EADDRINUSE
+        await new Promise<void>((resolve) => {
+          let done = false
+          const finish = () => { if (!done) { done = true; resolve() } }
+          try {
+            ;(cur as { closeAllConnections?: () => void }).closeAllConnections?.()
+            cur.close(() => finish())
+            setTimeout(finish, 2500)
+          } catch { finish() }
+        })
         live.delete(node.id)
       }
       killSockets()
