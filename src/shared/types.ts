@@ -50,6 +50,8 @@ export interface FaultInjection {
 export interface SignalDef {
   id: string
   name: string
+  /** 工艺语义描述(供平台 semantics / Agent 语义卡消费;写清物理意义与推荐窗口) */
+  description?: string
   unit?: string
   min?: number
   max?: number
@@ -136,6 +138,8 @@ export interface HttpPathMap {
 export interface DeviceNode {
   id: string
   name: string
+  /** 设备级工艺描述(段位/用途/上下游关系;导出与 UI 呈现) */
+  description?: string
   protocol: ProtocolKind
   enabled: boolean
   /** 设备全局节拍(ms):信号默认 tick */
@@ -198,6 +202,36 @@ export type PlantOutputKey =
   | 'defectImage'
   | 'gels'
 
+// ============================================================
+// biax:双向拉伸薄膜产线(BOPET 类)物理模型键空间
+// 全线 = 干燥上料 → 挤出 → 计量泵 → 模头铸片 → 纵拉 MDO → 横拉 TDO → 测厚 → 电晕/检测 → 收卷
+// ============================================================
+
+export type PlantModelKind = 'castfilm' | 'biax'
+
+export type BiaxControlKey =
+  // 干燥上料单元
+  | 'dryTemp' | 'dewPoint' | 'feedRate'
+  // 挤出机(机筒五区 + 螺杆)
+  | 'zone1' | 'zone2' | 'zone3' | 'zone4' | 'zone5' | 'screw'
+  // 熔体计量泵
+  | 'pump'
+  // 模头铸片单元(模唇/急冷辊/铸片速度/静电吸附)
+  | 'dieLip' | 'chillTemp' | 'castSpd' | 'pinning'
+  // 纵向拉伸 MDO(预热三辊 + 慢/快辊 + 退火)
+  | 'mdoPreheat1' | 'mdoPreheat2' | 'mdoPreheat3' | 'slowRoll' | 'fastRoll' | 'mdoAnneal'
+  // 横向拉伸 TDO 烘箱(预热/拉伸/定型 + 链速 + 出口轨宽)
+  | 'tdoPreheat' | 'tdoStretch' | 'tdoAnneal' | 'chain' | 'railOut'
+  // 电晕处理
+  | 'corona'
+  // 收卷(张力/锥度/接触辊/卷取速度)
+  | 'windTension' | 'windTaper' | 'windContact' | 'windSpeed'
+
+export type BiaxOutputKey =
+  | 'dryTemp' | 'moisture' | 'meltTemp' | 'meltPressure' | 'pumpOutlet' | 'castTemp'
+  | 'mdoTemp' | 'mdRatio' | 'tdoTemp' | 'tdRatio' | 'railWidth'
+  | 'thickness' | 'sigma' | 'profile' | 'defect' | 'haze' | 'dyne' | 'tension' | 'rollDia'
+
 export interface PlantBinding {
   nodeId: string
   signalId: string
@@ -248,20 +282,89 @@ export interface PlantParams {
   noiseGels: number
 }
 
-/** 稳态最优窗口(离线网格搜索产物,ground truth) */
+/** biax(双向拉伸薄膜产线)物理参数 */
+export interface BiaxParams {
+  /** 干燥塔温度响应时间常数(s) */
+  tauDry: number
+  /** 机筒加热区时间常数(s) */
+  tauZone: number
+  /** 区间热传导系数 0~1 */
+  kHeat: number
+  /** 熔体输送纯滞后(s) */
+  tauMelt: number
+  /** Arrhenius 粘度指数(K) */
+  arrheniusB: number
+  /** 参考粘度(Pa·s)/温度(℃) */
+  mu0: number
+  tRef: number
+  /** 计量泵流量系数(kg/h 每 rpm,参考粘度下) */
+  flowK: number
+  /** 泵出口压力增益(MPa @ 650 kg/h,参考粘度) */
+  pumpGain: number
+  /** 泵送腔时间常数(s) */
+  tauPump: number
+  /** 模口宽度(m) */
+  dieWidth: number
+  /** 铸片颈缩系数(铸片宽/模宽) */
+  neckIn: number
+  /** TDO 入口轨宽/铸片宽 */
+  railInFactor: number
+  /** 切边损失比例 */
+  trimFraction: number
+  /** 固化膜密度(kg/m³,PET) */
+  filmDensity: number
+  /** MDO 区长度(m) */
+  mdoLength: number
+  /** TDO 烘箱长度(m) */
+  tdoLength: number
+  /** TDO 出口到测厚仪距离(m) */
+  gaugeDistance: number
+  /** 收卷张力响应时间常数(s) */
+  tauTension: number
+  /** 纸芯/钢芯直径(m) */
+  rollCoreDiameter: number
+  /** PET 玻璃化温度(℃,决定拉伸窗口) */
+  tg: number
+  /** MDO 拉伸温度窗(℃) */
+  mdoWindow: [number, number]
+  /** TDO 拉伸温度窗(℃) */
+  tdoStretchWindow: [number, number]
+  /** 成品厚度规格目标(μm) */
+  thicknessTarget: number
+  /** 传感器噪声 σ */
+  noiseTemp: number
+  noisePressure: number
+  noiseThickness: number
+  noiseDefect: number
+  noiseMoisture: number
+}
+
+/** 稳态最优窗口(离线网格搜索产物,ground truth)。字段按模型种类取舍,分数恒在。 */
 export interface PlantOptimum {
-  zoneTemp: number
-  screw: number
-  lineSpeed: number
-  meltTemp: number
-  pressure: number
-  thickness: number
-  defect: number
+  /** 目标函数 J ∈ [0,100](约束外 = null 不入网格) */
   score: number
   computedAt: string
+  // ── castfilm 解 ──
+  zoneTemp?: number
+  screw?: number
+  lineSpeed?: number
+  meltTemp?: number
+  pressure?: number
+  thickness?: number
+  defect?: number
+  // ── biax 解 ──
+  castSpd?: number
+  slowRoll?: number
+  fastRoll?: number
+  railOut?: number
+  chain?: number
+  sigma?: number
+  haze?: number
 }
 
 export interface PlantModelConfig {
+  /** 模型种类(缺省 castfilm;biax = 双向拉伸全线物理引擎) */
+  kind?: PlantModelKind
   enabled: boolean
   /** 确定性噪声种子(可复现实验) */
   seed: number
@@ -269,12 +372,12 @@ export interface PlantModelConfig {
   dtMs: number
   /** 时间加速倍率(1 = 实时物理;实验用 4~8 压缩收敛等待) */
   timeScale: number
-  /** 控制输入绑定(DCW 写入的 SP 信号) */
-  controls: Record<PlantControlKey, PlantBinding>
-  /** 模型输出绑定(DAQ 采集信号,模型每拍覆写) */
-  outputs: Partial<Record<PlantOutputKey, PlantBinding>>
-  /** 物理参数(缺省用文献典型值) */
-  params?: Partial<PlantParams>
+  /** 控制输入绑定(DCW 写入的 SP 信号;按 kind 取键) */
+  controls: Partial<Record<PlantControlKey | BiaxControlKey, PlantBinding>>
+  /** 模型输出绑定(DAQ 采集信号,模型每拍覆写;按 kind 取键) */
+  outputs: Partial<Record<PlantOutputKey | BiaxOutputKey, PlantBinding>>
+  /** 物理参数(缺省用文献典型值;按 kind 解释) */
+  params?: Partial<PlantParams & BiaxParams>
   /** 当前工况阶段(脚本驱动,真值流打标) */
   phase: PlantPhase
   /** 扰动注入(加热衰减/进料阶跃/漂移) */
@@ -285,16 +388,16 @@ export interface PlantModelConfig {
   optimum?: PlantOptimum | null
 }
 
-/** plant-model 单步真值快照(JSONL 一行) */
+/** plant-model 单步真值快照(JSONL 一行;sp/truth/exposed 为「控制键→工程量」平面记录,按 kind 取键) */
 export interface PlantTruthSample {
   t: string
   phase: PlantPhase
   /** 控制输入(工程量) */
-  sp: { zone1: number, zone2: number, zone3: number, screw: number, lineSpeed: number, dieGap: number }
-  /** 物理真值(未加噪,评测用) */
-  truth: { zoneTemps: [number, number, number], meltTemp: number, pressure: number, flow: number, thickness: number, defect: number, gels: number, viscosity: number, transportDelayS: number }
+  sp: Record<string, number>
+  /** 物理真值(未加噪,评测用;按 kind 取键,castfilm 含 zoneTemps 数组) */
+  truth: Record<string, unknown>
   /** 协议暴露值(加噪后,Agent 看到的世界) */
-  exposed: { meltTemp: number, pressure: number, thickness: number, defect: number, gels: number }
+  exposed: Record<string, number>
 }
 
 /** WS 帧 */

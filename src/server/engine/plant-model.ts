@@ -76,8 +76,21 @@ export interface PlantControls {
   dieGap: number
 }
 
+/** castfilm 单步物理真值(具体形状;PlantTruthSample.truth 是跨模型的宽松记录) */
+export interface CastFilmTruth {
+  zoneTemps: [number, number, number]
+  meltTemp: number
+  pressure: number
+  flow: number
+  thickness: number
+  defect: number
+  gels: number
+  viscosity: number
+  transportDelayS: number
+}
+
 export interface PlantStepResult {
-  truth: PlantTruthSample['truth']
+  truth: CastFilmTruth
   exposed: PlantTruthSample['exposed']
   /** 厚度横向轮廓(64 点,μm;含轮廓成形噪声,不含传感器噪声) */
   profile: number[]

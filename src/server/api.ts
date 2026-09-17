@@ -11,11 +11,12 @@ import {
 import { getConfig, findNode, upsertNode, removeNode, saveConfig, genId, DATA_DIR } from './store'
 import { startNode, stopNode, isRunning } from './runtime'
 import { startProtocol, stopProtocol, summaryOf } from './protocols/registry'
-import { applyPreset, presetList, replaceAll } from './presets'
+import { applyPreset, presetList, presetBlueprint, replaceAll } from './presets'
 import {
   plantRunning, plantSnapshot, readTruth, setPhase, startPlantModel,
 } from './engine/plant-runtime'
 import { gridSearchOptimum } from './engine/plant-model'
+import { biaxGridSearchOptimum } from './engine/biax-model'
 import type { DeviceNode, PlantModelConfig, SimConfig, SignalDef } from '../shared/types'
 
 const ok = (data: unknown = null) => ({ code: 0, message: 'ok', data })
@@ -78,7 +79,7 @@ function nodeView(node: ReturnType<typeof findNode>) {
       protocol: summaryOf(node.id),
     },
     signals: (node.signals ?? []).map(s => ({
-      id: s.id, name: s.name, unit: s.unit, min: s.min, max: s.max,
+      id: s.id, name: s.name, description: s.description, unit: s.unit, min: s.min, max: s.max,
       decimals: s.decimals, strategy: s.strategy, faults: s.faults, tickMs: s.tickMs,
       value: s.runtime?.value ?? 0, hist: s.runtime?.hist ?? [],
     })),
@@ -112,9 +113,12 @@ export function createApi() {
   router.post('/nodes', defineEventHandler(async (event) => {
     const body = await readBody<Record<string, unknown>>(event) ?? {}
     if (!body.name || !body.protocol) throw fail(400, 'BAD_INPUT', 'name 与 protocol 必填')
+    // 允许调用方携带稳定 id(如 biax-* 清单式建线):同 id 存在即整备替换(upsert),否则新建
+    const wantedId = typeof body.id === 'string' && body.id.trim() ? body.id.trim() : ''
     const node = {
-      id: genId('dev'),
+      id: wantedId || genId('dev'),
       name: String(body.name),
+      description: typeof body.description === 'string' ? body.description : undefined,
       protocol: body.protocol as never,
       enabled: body.enabled !== false,
       tickMs: Number(body.tickMs ?? 1000),
@@ -136,6 +140,7 @@ export function createApi() {
     const wasEnabled = cur.enabled
     Object.assign(cur, {
       name: body.name !== undefined ? String(body.name) : cur.name,
+      description: body.description !== undefined ? String(body.description) : cur.description,
       enabled: body.enabled !== undefined ? Boolean(body.enabled) : cur.enabled,
       tickMs: body.tickMs !== undefined ? Number(body.tickMs) : cur.tickMs,
       signals: (body.signals ?? cur.signals) as never,
@@ -234,9 +239,41 @@ export function createApi() {
 
   router.get('/presets', defineEventHandler(() => ok(presetList())))
 
+  // 预设蓝图(dry-run):返回「若应用该预设会得到的节点清单 + 物理模型配置」,不改动现场。
+  // 供外部「探测→补建」式建线消费(如 AgentWorkShop bench 的 biax ensure 阶段)。
+  router.get('/presets/:key', defineEventHandler((event) => {
+    const key = getRouterParam(event, 'key') ?? ''
+    const bp = presetBlueprint(key)
+    if (!bp) throw fail(404, 'NOT_FOUND', `未知预设: ${key}`)
+    return ok({
+      key,
+      nodes: bp.nodes.map(n => ({
+        id: n.id, name: n.name, description: n.description, protocol: n.protocol,
+        enabled: n.enabled, tickMs: n.tickMs, signals: n.signals, config: n.config,
+      })),
+      plantModel: bp.plantModel,
+    })
+  }))
+
   // ---------- 工艺模型(plant-model):状态 / 真值流 / 工况阶段 / 离线最优窗口 ----------
 
   router.get('/plant/state', defineEventHandler(() => ok(plantSnapshot())))
+
+  // 装载/替换物理模型配置(绑定 + 参数;不动任何节点)——「只补建节点、不整包重置」建线的关键拼图。
+  // body: { plantModel: PlantModelConfig, warm?: boolean }。装载后立即重启模型(warm=热态复位)。
+  router.put('/plant/config', defineEventHandler(async (event) => {
+    const body = await readBody<{ plantModel?: PlantModelConfig, warm?: boolean }>(event) ?? {}
+    const pm = body.plantModel
+    if (!pm || typeof pm !== 'object' || !pm.controls || !pm.outputs) {
+      throw fail(400, 'BAD_INPUT', 'plantModel 必填且含 controls/outputs 绑定')
+    }
+    const cfg = getConfig()
+    cfg.plantModel = { ...pm, optimum: null }
+    cfg.activeScenario = undefined
+    saveConfig()
+    startPlantModel(body.warm === true)
+    return ok(plantSnapshot())
+  }))
 
   router.get('/plant/truth', defineEventHandler((event) => {
     const q = getQuery(event)
@@ -254,11 +291,13 @@ export function createApi() {
     return ok(plantSnapshot())
   }))
 
-  // 离线稳态最优窗口 W*(网格搜索;ground truth,评测基准)
+  // 离线稳态最优窗口 W*(网格搜索;ground truth,评测基准)——按模型种类选网格
   router.get('/plant/optimum', defineEventHandler(() => {
     const cfg = getConfig().plantModel
     if (cfg?.optimum) return ok(cfg.optimum)
-    const optimum = gridSearchOptimum(cfg?.params)
+    const optimum = cfg?.kind === 'biax'
+      ? biaxGridSearchOptimum(cfg.params)
+      : gridSearchOptimum(cfg?.params)
     if (cfg) { cfg.optimum = optimum; saveConfig() }
     return ok(optimum)
   }))
@@ -358,17 +397,25 @@ function jsonPathFromTemplate(template: string | undefined, placeholder = 'value
   catch { return undefined }
 }
 
-/** 生成主项目对接配置(每个信号一条:driver + driverConfig + 建议采样周期) */
+/** 生成主项目对接配置(每个信号一条:driver + driverConfig + 工艺描述 + 建议采样周期) */
 function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
   const cfg = node.config
-  const items: Array<{ signal: string, driver: string, format?: string, driverConfig: Record<string, unknown>, curl: string }> = []
-  const push = (signal: string, driver: string, driverConfig: Record<string, unknown>, format?: string) => {
+  const items: Array<{ signal: string, description?: string, unit?: string, min?: number, max?: number, decimals?: number, driver: string, format?: string, driverConfig: Record<string, unknown>, curl: string }> = []
+  const push = (signal: string, driver: string, driverConfig: Record<string, unknown>, format?: string, meta?: SignalDef) => {
     const curl = [
       `curl -s -X POST http://127.0.0.1:3021/api/workshop/daq/test-driver`,
       `  -H 'content-type: application/json'`,
       `  -d '${JSON.stringify({ driver, driverConfig })}'`,
     ].join('\\n')
-    items.push({ signal, driver, ...(format ? { format } : {}), driverConfig, curl })
+    items.push({
+      signal, driver, ...(format ? { format } : {}),
+      ...(meta?.description ? { description: meta.description } : {}),
+      ...(meta?.unit != null ? { unit: meta.unit } : {}),
+      ...(meta?.min != null ? { min: meta.min } : {}),
+      ...(meta?.max != null ? { max: meta.max } : {}),
+      ...(meta?.decimals != null ? { decimals: meta.decimals } : {}),
+      driverConfig, curl,
+    })
   }
   for (const s of node.signals ?? []) {
     if (node.protocol === 'modbus-tcp' || node.protocol === 'modbus-rtu') {
@@ -377,12 +424,12 @@ function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
       push(s.name, node.protocol, {
         host: '127.0.0.1', port: cfg.port, unitId: cfg.unitId ?? 1,
         register: m.address, registerType: m.area, dataType: m.dataType, byteOrder: m.byteOrder,
-      }, s.format)
+      }, s.format, s)
     }
     else if (node.protocol === 'opcua') {
       const v = (cfg.opcVars ?? []).find(x => x.signalId === s.id)
       if (!v) continue
-      push(s.name, 'opcua', { endpoint: `opc.tcp://127.0.0.1:${cfg.port ?? 4840}`, nodeId: v.nodeId }, s.format)
+      push(s.name, 'opcua', { endpoint: `opc.tcp://127.0.0.1:${cfg.port ?? 4840}`, nodeId: v.nodeId }, s.format, s)
     }
     else if (node.protocol === 'mqtt') {
       // 命令主题(设定值):本信号是 commandSignalId 时导出**可写**配置
@@ -393,7 +440,7 @@ function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
         push(s.name, 'mqtt', {
           host: '127.0.0.1', port: Number(new URL(cfg.brokerUrl ?? 'mqtt://127.0.0.1:18830').port ?? 1883),
           topic: cfg.commandTopic, jsonKey: 'setpoint',
-        }, s.format)
+        }, s.format, s)
         continue
       }
       const t = (cfg.topics ?? []).find(x => x.signalId === s.id)
@@ -402,7 +449,7 @@ function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
       push(s.name, 'mqtt', {
         host: '127.0.0.1', port: Number(new URL(cfg.brokerUrl ?? 'mqtt://127.0.0.1:18830').port ?? 1883),
         topic: t.topic, ...(jp ? { jsonPath: jp } : {}),
-      }, s.format)
+      }, s.format, s)
     }
     else if (node.protocol === 'http') {
       const p = (cfg.paths ?? []).find(x => x.signalId === s.id)
@@ -414,8 +461,8 @@ function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
         url: `http://127.0.0.1:${process.env.SIM_PORT ?? 4010}/sim-http/${node.id}${p.path}`,
         // 主项目 http 驱动要求 jsonPath 提取(JSON 报文);纯数字文本则无需
         ...(jp ? { jsonPath: jp } : {}),
-      }, s.format)
+      }, s.format, s)
     }
   }
-  return { device: { id: node.id, name: node.name, protocol: node.protocol }, items }
+  return { device: { id: node.id, name: node.name, description: node.description, protocol: node.protocol }, items }
 }

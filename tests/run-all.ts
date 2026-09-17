@@ -6,6 +6,7 @@ let failed = 0
 const SUITES = [
   './engine-signals.test.ts',
   './plant-model.test.ts',
+  './biax-model.test.ts',
   './protocol-modbus.test.ts',
   './protocol-opcua.test.ts',
   './protocol-mqtt.test.ts',

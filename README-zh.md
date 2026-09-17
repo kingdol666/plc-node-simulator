@@ -65,6 +65,17 @@ zone1/2/3 SP(MBTCP 40021/23/25) ─→ 加热区一阶惯性+区间热传导(τ=
 - REST:`GET /api/plant/state`(瞬时状态)、`GET /api/plant/truth`(真值流)、`POST /api/plant/phase`(warmup/steady/batch/disturb 工况打标 + 扰动注入 heaterDecay/feedTempStep/feedDriftPerMin)、`GET /api/plant/optimum`(**离线网格搜索最优窗口 W***,孪生独有 ground truth)
 - 物理一致性断言(`npm test`):阶跃收敛/幅值=解析解±2%/滞后反比/停加热压降先升后降/同 seed 复现/稳态代数解≡积分值
 
+## plant-model kind=biax:双拉薄膜产线数字孪生(biax-line 预设)
+
+**BOPET 类双向拉伸全线**:干燥上料 → 挤出(机筒五区+螺杆) → 熔体计量泵 → T 模头铸片(急冷辊/静电毛贴)
+→ 纵拉 MDO(预热辊×3+快慢辊拉伸比) → 横拉 TDO 烘箱(预热/拉伸/定型+轨道展幅) → 在线测厚 → 电晕/表面检测 → 收卷(张力锥度/卷径)。
+
+- 9 设备五协议,**30 DCW + 19 DAQ,每个信号带工艺语义描述(description)**——导出后进主项目 semantics → Agent 语义卡
+- 厚度因果链(与真机同向):铸片 h₀=Q/(w·v_cast·ρ) → 纵拉 h₁=h₀/R_md(R_md=快/慢辊速比) → 横拉 h₂=h₁/R_td·(1−松弛)
+- 拉伸温度窗(MDO 86~110℃ / TDO 拉伸 98~128℃)跌破 → σ 与缺陷率急剧恶化(冷拉颈缩);定型段温度决定雾度;收卷张力出窗(55~120N)→ 勒痕
+- 起始工况次优(厚度 ≈28μm,规格 25.0±0.8)→ 留给 AgentTeam 多节点闭环寻优;`GET /api/plant/optimum` 返回 biax W*(铸速/快辊/轨宽/链速网格,厚度入规格)
+- 「探测→补建」式建线:`GET /api/presets/biax-line` 返回**蓝图 dry-run**(期望节点+物理模型配置,不动现场);`POST /api/nodes` 支持固定 id upsert;`PUT /api/plant/config` 只装载/替换物理模型绑定(不动节点)——外部流水线可按差分补建缺失设备
+
 ## 命名场景(工况隔离管理)
 
 ```bash
@@ -80,7 +91,7 @@ curl -X GET  http://127.0.0.1:4010/api/scenarios               # 列表
 - 设备卡片:协议徽章/端点/实时值/迷你趋势,启停
 - 编辑器:通信配置 + 寄存器/变量/主题/端点映射表 + 信号策略参数 + 故障注入
 - 点击信号数值 → 手动覆写(模拟操作工设定)
-- 「薄膜产线预设」一键生成五协议模拟产线(信号语义对齐主项目 DAQ 模板);「挤出流延数字孪生」预设生成 6 DCW + 7 DAQ 物理联动产线
+- 「薄膜产线预设」一键生成五协议模拟产线(信号语义对齐主项目 DAQ 模板);「挤出流延数字孪生」预设生成 6 DCW + 7 DAQ 物理联动产线;「双拉薄膜产线数字孪生」预设生成 9 设备 30 DCW + 19 DAQ 全线物理联动产线
 - **对接导出**:每设备生成主项目 driverConfig JSON + curl(test-driver 两条),消除手工对照
 - 配置导入/导出 JSON(data/config.json 原子写,重启不丢)
 

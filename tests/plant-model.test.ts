@@ -142,8 +142,8 @@ function warmup(m: CastFilmModel, seconds = 240): void {
 // ── ⑦ 网格搜索 W*:可行 + 名义点在窗口附近 ──
 {
   const best = gridSearchOptimum()
-  check('⑦ W* 厚度达标(50±2μm)', Math.abs(best.thickness - 50) <= 2, `h*=${best.thickness}μm @ T=${best.zoneTemp} N=${best.screw} v=${best.lineSpeed}`)
-  check('⑦ W* 约束内(Tm∈[195,225], P≤22)', best.meltTemp >= 195 && best.meltTemp <= 225 && best.pressure <= 22, `Tm=${best.meltTemp} P=${best.pressure}`)
+  check('⑦ W* 厚度达标(50±2μm)', Math.abs(best.thickness! - 50) <= 2, `h*=${best.thickness}μm @ T=${best.zoneTemp} N=${best.screw} v=${best.lineSpeed}`)
+  check('⑦ W* 约束内(Tm∈[195,225], P≤22)', best.meltTemp! >= 195 && best.meltTemp! <= 225 && best.pressure! <= 22, `Tm=${best.meltTemp} P=${best.pressure}`)
   check('⑦ W* 分量为正', best.score > 0, `J*=${best.score}`)
 }
 
