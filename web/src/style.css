@@ -30,6 +30,44 @@ body { margin: 0; font: 13px/1.6 'Cascadia Code', 'JetBrains Mono', Consolas, 'M
 .head .sub { color: var(--ink-faint); font-size: 12px; }
 .head .spacer { flex: 1; }
 
+/* 实时链路指示:一眼看出"数据是不是真的在流"(而不必盯着数字猜)。
+   三态:open 绿点呼吸 / connecting 琥珀 / closed 红点。 */
+.head .live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.head .live .live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+
+.head .live.open { color: var(--accent); border-color: rgba(63, 228, 171, 0.45); background: var(--accent-dim); }
+.head .live.open .live-dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: livePulse 1.6s ease-in-out infinite; }
+.head .live.connecting { color: var(--warn); border-color: rgba(244, 184, 65, 0.4); }
+.head .live.connecting .live-dot { background: var(--warn); }
+.head .live.closed { color: var(--danger); border-color: rgba(244, 92, 92, 0.45); }
+.head .live.closed .live-dot { background: var(--danger); }
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .head .live.open .live-dot { animation: none; }
+}
+
 /* 按钮/输入 */
 .btn { background: var(--paper-tint); border: 1px solid var(--line-strong); color: var(--ink); border-radius: var(--radius); padding: 5px 12px; cursor: pointer; font: inherit; font-size: 12px; transition: border-color .15s, background .15s; }
 .btn:hover { border-color: var(--accent); color: var(--accent); }

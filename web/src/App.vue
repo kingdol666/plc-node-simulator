@@ -17,10 +17,21 @@ const api = async (path, method = 'GET', body) => {
 }
 const reload = async () => { nodes.value = await api('/api/nodes') }
 
-/* ── WS 实时 ── */
+/* ── WS 实时 ──
+ * 服务端每台设备各推一帧 signal.update(nodeId = 真实设备 id),
+ * 前端按 nodeId + signalId 落到卡片上;同时统计帧率/最后到达时间并显示在页头,
+ * 让"是不是真的在实时"变成一眼可见的状态,而不是靠盯着数字猜。 */
 const liveValues = reactive({}) // nodeId -> { sigId: { value, hist } }
+const wsState = ref('connecting') // connecting | open | closed
+const wsFps = ref(0)
+const wsLastAt = ref(0)
+let wsFrames = 0
+let wsFpsTimer = null
+
 function connectWs() {
+  wsState.value = 'connecting'
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`)
+  ws.onopen = () => { wsState.value = 'open' }
   ws.onmessage = (ev) => {
     try {
       const f = JSON.parse(ev.data)
@@ -32,11 +43,25 @@ function connectWs() {
         cur.hist.push(s.value)
         if (cur.hist.length > 60) cur.hist.shift()
       }
+      wsFrames++
+      wsLastAt.value = Date.now()
     }
     catch { /* 忽略坏帧 */ }
   }
-  ws.onclose = () => setTimeout(connectWs, 2000)
+  ws.onclose = () => {
+    wsState.value = 'closed'
+    wsFps.value = 0
+    setTimeout(connectWs, 2000)
+  }
+  ws.onerror = () => { wsState.value = 'closed' }
 }
+
+/** 帧率按秒统计(用于页头"实时"指示) */
+const wsLabel = computed(() => {
+  if (wsState.value === 'open') return `实时 WS · ${wsFps.value} 帧/s`
+  if (wsState.value === 'connecting') return '连接中…'
+  return '已断开 · 重连中'
+})
 
 /* ── 协议元数据(动态表单 schema) ── */
 const PROTOCOLS = {
@@ -180,8 +205,18 @@ const endpointText = (n) => {
   }
 }
 
-onMounted(() => { reload(); connectWs() })
-onUnmounted(() => ws?.close())
+onMounted(() => {
+  reload()
+  connectWs()
+  wsFpsTimer = setInterval(() => {
+    wsFps.value = wsFrames
+    wsFrames = 0
+  }, 1000)
+})
+onUnmounted(() => {
+  ws?.close()
+  clearInterval(wsFpsTimer)
+})
 </script>
 
 <template>
@@ -189,6 +224,9 @@ onUnmounted(() => ws?.close())
     <header class="head">
       <h1>PLC 节点模拟器</h1>
       <span class="sub">多协议虚拟工业设备 · Modbus TCP/RTU · OPC UA · MQTT · HTTP</span>
+      <span class="live" :class="wsState" :title="wsLastAt ? '最后收到数据 ' + new Date(wsLastAt).toLocaleTimeString() : '尚未收到数据'">
+        <span class="live-dot" />{{ wsLabel }}
+      </span>
       <span class="spacer" />
       <button class="btn ghost" @click="doExportAll">导出配置</button>
       <button class="btn ghost" @click="showImport = true">导入配置</button>
