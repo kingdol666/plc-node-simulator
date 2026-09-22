@@ -179,8 +179,13 @@ export interface DeviceNode {
 
 export interface SimConfig {
   nodes: DeviceNode[]
-  /** 工艺模型(数字孪生物理引擎;单产线级,跨设备联动) */
+  /** 工艺模型(数字孪生物理引擎;单产线级,跨设备联动)。遗留单引擎主位:GET /api/plant/* 缺省目标。 */
   plantModel?: PlantModelConfig
+  /**
+   * 多引擎并存(2026-09 起支持多场景同时闭环):与 plantModel 共存,
+   * 每项以 id(场景键)为唯一键;put /plant/config?upsert 按 id 增量装载,互不干扰。
+   */
+  plantModels?: PlantModelConfig[]
   /** 当前激活的命名场景(隔离管理用;仅元数据) */
   activeScenario?: string
 }
@@ -207,7 +212,7 @@ export type PlantOutputKey =
 // 全线 = 干燥上料 → 挤出 → 计量泵 → 模头铸片 → 纵拉 MDO → 横拉 TDO → 测厚 → 电晕/检测 → 收卷
 // ============================================================
 
-export type PlantModelKind = 'castfilm' | 'biax'
+export type PlantModelKind = 'castfilm' | 'biax' | 'injection' | 'wwtp' | 'anneal'
 
 export type BiaxControlKey =
   // 干燥上料单元
@@ -231,6 +236,45 @@ export type BiaxOutputKey =
   | 'dryTemp' | 'moisture' | 'meltTemp' | 'meltPressure' | 'pumpOutlet' | 'castTemp'
   | 'mdoTemp' | 'mdRatio' | 'tdoTemp' | 'tdRatio' | 'railWidth'
   | 'thickness' | 'sigma' | 'profile' | 'defect' | 'haze' | 'dyne' | 'tension' | 'rollDia'
+
+// ============================================================
+// injection:注塑成型产线(注塑机 + 模温机 + 注射/保压单元 + 冷却 + 质检)物理模型键空间
+// ============================================================
+
+export type InjectionControlKey =
+  | 'barrelTemp1' | 'barrelTemp2' | 'barrelTemp3' | 'barrelTemp4'
+  | 'screw' | 'injectSpeed' | 'holdPressure' | 'holdTime'
+  | 'moldTemp' | 'clampForce' | 'coolWater'
+
+export type InjectionOutputKey =
+  | 'meltTemp' | 'meltPressure' | 'moldTemp' | 'clampForce' | 'injPressure'
+  | 'waterTemp' | 'coolFlow' | 'partWeight' | 'flash' | 'sink' | 'dimDev' | 'cycleTime'
+  | 'profile' | 'image'
+
+// ============================================================
+// wwtp:A2O 污水生化处理物理模型键空间(曝气/加药/回流排泥/进水/出水检测)
+// ============================================================
+
+export type WwtpControlKey =
+  | 'blowerHz' | 'naohDose' | 'pacDose'
+  | 'recycleInt' | 'recycleSludge' | 'wasteSludge' | 'influentFlow'
+
+export type WwtpOutputKey =
+  | 'airPressure' | 'do' | 'naohFlow' | 'pacFlow' | 'mlss'
+  | 'codIn' | 'nh3In' | 'codOut' | 'nh3Out' | 'tpOut' | 'ph' | 'turbidity'
+  | 'doProfile'
+
+// ============================================================
+// anneal:连续退火产线(加热段/炉内传动/冷却过时效/保护气/质检)物理模型键空间
+// ============================================================
+
+export type AnnealControlKey =
+  | 'zone1' | 'zone2' | 'zone3' | 'lineSpeed' | 'oaTemp' | 'coolRate' | 'h2'
+
+export type AnnealOutputKey =
+  | 'furnaceTemp' | 'stripTemp' | 'actSpeed' | 'oaTemp' | 'dewPoint' | 'h2Act'
+  | 'hardness' | 'tensile' | 'yieldStr' | 'grainSize' | 'surfaceDef'
+  | 'flatness'
 
 export interface PlantBinding {
   nodeId: string
@@ -339,6 +383,89 @@ export interface BiaxParams {
   noiseMoisture: number
 }
 
+/** injection(注塑成型)物理参数 */
+export interface InjectionParams {
+  /** 机筒加热区时间常数(s) */
+  tauZone: number
+  /** 熔体温度时间常数(s) */
+  tauMelt: number
+  /** 模具温度时间常数(s) */
+  tauMold: number
+  /** 模温机对模具目标温度的耦合系数(℃ 每 ℃ 冷却水温偏离 25) */
+  coolCouple: number
+  /** 区权(四区) */
+  zoneW: [number, number, number, number]
+  /** 克重-保压增益(g/bar) */
+  kW: number
+  /** 克重-保压时间增益(g/s) */
+  kWt: number
+  /** 克重-熔温增益(g/℃,熔温越高比容越大) */
+  kWT: number
+  /** 飞边起始保压(bar)与斜率 */
+  flashStart: number
+  flashK: number
+  /** 缩痕基准(%)与保压斜率 */
+  sinkBase: number
+  sinkK: number
+  /** 目标克重(g)与规格窗(g) */
+  weightTarget: number
+  weightTol: number
+  noiseTemp: number
+  noiseWeight: number
+  noiseQuality: number
+}
+
+/** wwtp(A2O 污水生化处理)物理参数 */
+export interface WwtpParams {
+  /** 曝气池有效容积(m³) */
+  volume: number
+  /** kLa 基准(h⁻¹ @ 30Hz)与频率指数 */
+  klaBase: number
+  klaExp: number
+  /** 氧饱和浓度(mg/L) */
+  cSat: number
+  /** 基准氧利用率 OUR(mg/L/h @ 1000m³/h, CODin 420, MLSS 4900) */
+  ourBase: number
+  /** COD 去除:最大去除率/DO 动力学系数 */
+  etaCodMax: number
+  kCod: number
+  /** 硝化:氨氮动力学系数 */
+  kNh3: number
+  /** 化学除磷:PAC 半饱和常数(L/h)与最大吸附率 */
+  pacK: number
+  pacMax: number
+  /** 生物除磷基础去除率 */
+  pBioBase: number
+  /** MLSS-排泥斜率(mg/L 每 m³/d) */
+  mlssWasteK: number
+  noiseDo: number
+  noiseQuality: number
+}
+
+/** anneal(连续退火)物理参数 */
+export interface AnnealParams {
+  /** 加热段长度(m) */
+  heatLength: number
+  /** 区权(三区) */
+  zoneW: [number, number, number]
+  /** 带温-炉温传递系数与线速敏感系数 */
+  stripGain: number
+  stripSpeedK: number
+  /** H2 含量对传热的增益(℃ 每 %) */
+  h2HeatK: number
+  /** 热指数参考温度(℃,≈Ac1 附近)与归一化时间(s⁻¹ 指数底) */
+  smpT0: number
+  smpTau: number
+  /** 硬度渐近值(HV)与欠退火幅度(HV) */
+  hvBase: number
+  hvAmp: number
+  /** 硬度-抗拉增益(MPa 每 HV) */
+  tsK: number
+  tsBase: number
+  noiseTemp: number
+  noiseQuality: number
+}
+
 /** 稳态最优窗口(离线网格搜索产物,ground truth)。字段按模型种类取舍,分数恒在。 */
 export interface PlantOptimum {
   /** 目标函数 J ∈ [0,100](约束外 = null 不入网格) */
@@ -360,10 +487,12 @@ export interface PlantOptimum {
   chain?: number
   sigma?: number
   haze?: number
+  /** 各 kind 的最优设定值快照(控制键→工程量;与具体模型对齐) */
+  settings?: Record<string, number>
 }
 
 export interface PlantModelConfig {
-  /** 模型种类(缺省 castfilm;biax = 双向拉伸全线物理引擎) */
+  /** 模型种类(缺省 castfilm;biax/injection/wwtp/anneal = 各自产线物理引擎) */
   kind?: PlantModelKind
   enabled: boolean
   /** 确定性噪声种子(可复现实验) */
@@ -373,11 +502,11 @@ export interface PlantModelConfig {
   /** 时间加速倍率(1 = 实时物理;实验用 4~8 压缩收敛等待) */
   timeScale: number
   /** 控制输入绑定(DCW 写入的 SP 信号;按 kind 取键) */
-  controls: Partial<Record<PlantControlKey | BiaxControlKey, PlantBinding>>
+  controls: Partial<Record<PlantControlKey | BiaxControlKey | InjectionControlKey | WwtpControlKey | AnnealControlKey, PlantBinding>>
   /** 模型输出绑定(DAQ 采集信号,模型每拍覆写;按 kind 取键) */
-  outputs: Partial<Record<PlantOutputKey | BiaxOutputKey, PlantBinding>>
+  outputs: Partial<Record<PlantOutputKey | BiaxOutputKey | InjectionOutputKey | WwtpOutputKey | AnnealOutputKey, PlantBinding>>
   /** 物理参数(缺省用文献典型值;按 kind 解释) */
-  params?: Partial<PlantParams & BiaxParams>
+  params?: Partial<PlantParams & BiaxParams & InjectionParams & WwtpParams & AnnealParams>
   /** 当前工况阶段(脚本驱动,真值流打标) */
   phase: PlantPhase
   /** 扰动注入(加热衰减/进料阶跃/漂移) */
@@ -386,6 +515,8 @@ export interface PlantModelConfig {
   truthExport?: boolean
   /** 离线稳态最优窗口(网格搜索缓存;null = 未计算) */
   optimum?: PlantOptimum | null
+  /** 多引擎并存时的实例 id(场景键,如 injection/wwtp/anneal;单引擎遗留路径缺省) */
+  id?: string
 }
 
 /** plant-model 单步真值快照(JSONL 一行;sp/truth/exposed 为「控制键→工程量」平面记录,按 kind 取键) */

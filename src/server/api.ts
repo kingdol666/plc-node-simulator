@@ -13,10 +13,13 @@ import { startNode, stopNode, isRunning } from './runtime'
 import { startProtocol, stopProtocol, summaryOf } from './protocols/registry'
 import { applyPreset, presetList, presetBlueprint, replaceAll } from './presets'
 import {
-  plantRunning, plantSnapshot, readTruth, setPhase, startPlantModel,
+  plantRunning, plantSnapshot, readTruth, setPhase, startPlantModel, upsertPlantModel, resetPlantEngine,
 } from './engine/plant-runtime'
 import { gridSearchOptimum } from './engine/plant-model'
 import { biaxGridSearchOptimum } from './engine/biax-model'
+import { injectionGridSearchOptimum } from './engine/injection-model'
+import { wwtpGridSearchOptimum } from './engine/wwtp-model'
+import { annealGridSearchOptimum } from './engine/anneal-model'
 import type { DeviceNode, PlantModelConfig, SimConfig, SignalDef } from '../shared/types'
 
 const ok = (data: unknown = null) => ({ code: 0, message: 'ok', data })
@@ -48,6 +51,7 @@ async function applyScenario(name: string, boot: (n: DeviceNode) => Promise<void
   const j = JSON.parse(fs.readFileSync(file, 'utf-8')) as { name: string, config: SimConfig }
   const cfg = getConfig()
   cfg.plantModel = j.config.plantModel
+  cfg.plantModels = j.config.plantModels ?? []
   cfg.activeScenario = j.name
   await replaceAll(j.config.nodes ?? [])
   startPlantModel()
@@ -260,14 +264,22 @@ export function createApi() {
   router.get('/plant/state', defineEventHandler(() => ok(plantSnapshot())))
 
   // 装载/替换物理模型配置(绑定 + 参数;不动任何节点)——「只补建节点、不整包重置」建线的关键拼图。
-  // body: { plantModel: PlantModelConfig, warm?: boolean }。装载后立即重启模型(warm=热态复位)。
+  // body: { plantModel: PlantModelConfig, warm?: boolean, upsert?: boolean, id?: string }。
+  //   upsert=true:按 id 增量装载到 plantModels[](多场景共存,不动主位与其他引擎),id 缺省取 body.id;
+  //   缺省(遗留语义):替换主位 plantModel(其他引擎保留),装载后立即重启(warm=热态复位)。
   router.put('/plant/config', defineEventHandler(async (event) => {
-    const body = await readBody<{ plantModel?: PlantModelConfig, warm?: boolean }>(event) ?? {}
+    const body = await readBody<{ plantModel?: PlantModelConfig, id?: string, warm?: boolean, upsert?: boolean }>(event) ?? {}
     const pm = body.plantModel
     if (!pm || typeof pm !== 'object' || !pm.controls || !pm.outputs) {
       throw fail(400, 'BAD_INPUT', 'plantModel 必填且含 controls/outputs 绑定')
     }
     const cfg = getConfig()
+    if (body.upsert) {
+      const id = pm.id ?? (typeof body.id === 'string' && body.id.trim() ? body.id.trim() : '')
+      if (!id) throw fail(400, 'BAD_INPUT', 'upsert 装载需要 plantModel.id 或 body.id(场景键)')
+      upsertPlantModel({ ...pm, id }, body.warm === true)
+      return ok(plantSnapshot())
+    }
     cfg.plantModel = { ...pm, optimum: null }
     cfg.activeScenario = undefined
     saveConfig()
@@ -278,50 +290,50 @@ export function createApi() {
   router.get('/plant/truth', defineEventHandler((event) => {
     const q = getQuery(event)
     const limit = Math.min(Math.max(Number(q.limit ?? 500), 1), 5000)
-    return ok({ running: plantRunning(), samples: readTruth(limit) })
+    const id = typeof q.id === 'string' && q.id ? q.id : undefined
+    return ok({ running: plantRunning(), samples: readTruth(limit, id) })
   }))
 
-  // 工况阶段切换(打标真值流;SP 变更走真实协议写,由脚本/Agent 驱动)
+  // 工况阶段切换(打标真值流;SP 变更走真实协议写,由脚本/Agent 驱动)。id 缺省 = 主位。
   router.post('/plant/phase', defineEventHandler(async (event) => {
-    const body = await readBody<{ phase?: string, disturbances?: PlantModelConfig['disturbances'] }>(event) ?? {}
+    const body = await readBody<{ phase?: string, disturbances?: PlantModelConfig['disturbances'], id?: string }>(event) ?? {}
     const valid = ['warmup', 'steady', 'batch', 'disturb']
     if (!body.phase || !valid.includes(body.phase)) throw fail(400, 'BAD_INPUT', `phase 必填且 ∈ ${valid.join('/')}`)
-    const cfg = setPhase(body.phase as PlantModelConfig['phase'], body.disturbances)
+    const cfg = setPhase(body.phase as PlantModelConfig['phase'], body.disturbances, typeof body.id === 'string' ? body.id : undefined)
     if (!cfg) throw fail(400, 'NO_PLANT', '工艺模型未配置(需 cast-film-physics 预设或 plantModel 配置)')
     return ok(plantSnapshot())
   }))
 
-  // 离线稳态最优窗口 W*(网格搜索;ground truth,评测基准)——按模型种类选网格
-  router.get('/plant/optimum', defineEventHandler(() => {
-    const cfg = getConfig().plantModel
-    if (cfg?.optimum) return ok(cfg.optimum)
-    const optimum = cfg?.kind === 'biax'
-      ? biaxGridSearchOptimum(cfg.params)
-      : gridSearchOptimum(cfg?.params)
-    if (cfg) { cfg.optimum = optimum; saveConfig() }
+  // 离线稳态最优窗口 W*(网格搜索;ground truth,评测基准)——按模型种类选网格。?id= 指定引擎。
+  router.get('/plant/optimum', defineEventHandler((event) => {
+    const q = getQuery(event)
+    const id = typeof q.id === 'string' && q.id ? q.id : undefined
+    const cfg = getConfig()
+    const target = id
+      ? [...(cfg.plantModels ?? []), ...(cfg.plantModel ? [cfg.plantModel] : [])].find(m => m.id === id)
+      : cfg.plantModel
+    if (!target) throw fail(400, 'NO_PLANT', `工艺模型未配置${id ? `(引擎 ${id} 不存在)` : ''}`)
+    if (target.optimum) return ok(target.optimum)
+    const optimum = target.kind === 'biax' ? biaxGridSearchOptimum(target.params)
+      : target.kind === 'injection' ? injectionGridSearchOptimum(target.params)
+      : target.kind === 'wwtp' ? wwtpGridSearchOptimum(target.params)
+      : target.kind === 'anneal' ? annealGridSearchOptimum(target.params)
+      : gridSearchOptimum(target.params)
+    target.optimum = optimum
+    saveConfig()
     return ok(optimum)
   }))
 
   /**
    * 物理模型复位 —— 多 seed 可复现 benchmark 的前提。
-   * body: { seed?, phase?, disturbances?, params? }。重置 RNG 与初始状态并重开真值流;
+   * body: { seed?, phase?, disturbances?, params?, warm?, id? }。重置 RNG 与初始状态并重开真值流;
    * 仅当 params 变化时作废 W*(W* 是稳态网格解,与 RNG seed 无关)。
+   * id 缺省 = 主位(遗留语义);指定 id = 只复位该引擎(多场景共存时互不干扰)。
    */
   router.post('/plant/reset', defineEventHandler(async (event) => {
-    const body = await readBody<{ seed?: number, phase?: string, disturbances?: PlantModelConfig['disturbances'], params?: Record<string, number>, warm?: boolean }>(event) ?? {}
-    const cfg = getConfig().plantModel
-    if (!cfg) throw fail(400, 'NO_PLANT', '工艺模型未配置(需 cast-film-physics 预设)')
-    if (Number.isFinite(Number(body.seed))) cfg.seed = Number(body.seed)
-    if (body.phase && ['warmup', 'steady', 'batch', 'disturb'].includes(body.phase)) {
-      cfg.phase = body.phase as PlantModelConfig['phase']
-    }
-    if (body.disturbances) cfg.disturbances = { ...(cfg.disturbances ?? {}), ...body.disturbances }
-    if (body.params) {
-      cfg.params = { ...(cfg.params ?? {}), ...body.params } as PlantModelConfig['params']
-      delete (cfg as { optimum?: unknown }).optimum
-    }
-    saveConfig()
-    startPlantModel(body.warm === true)
+    const body = await readBody<{ seed?: number, phase?: string, disturbances?: PlantModelConfig['disturbances'], params?: Record<string, number>, warm?: boolean, id?: string }>(event) ?? {}
+    const target = resetPlantEngine(body)
+    if (!target) throw fail(400, 'NO_PLANT', `工艺模型未配置${body.id ? `(引擎 ${body.id} 不存在)` : '(需 cast-film-physics 预设)'}`)
     return ok(plantSnapshot())
   }))
 

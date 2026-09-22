@@ -60,7 +60,10 @@ function parsePdu(unitId: number, fc: number, pdu: Buffer): Pending {
     const start = (pdu[0] << 8) | pdu[1]
     const count = (pdu[2] << 8) | pdu[3]
     const values: number[] = []
-    for (let i = 0; i < count; i++) values.push((pdu[6 + i * 2] << 8) | pdu[7 + i * 2])
+    // FC16 PDU: start(2)+count(2)+byteCount(1)+data —— data 从 pdu[5] 起;
+    // 曾错用 pdu[6](把 byteCount 当数据高位字的高字节)→ RTU 写恒写入错值/0
+    // (2026-09-21 协议级读写实测暴露:TCP 走 modbus-serial ServerTCP 不经此路径,故流水线未覆盖)
+    for (let i = 0; i < count; i++) values.push((pdu[5 + i * 2] << 8) | pdu[6 + i * 2])
     return { unitId, fc, start, count, writeValues: values }
   }
   return { unitId, fc, start: 0, count: 0 }
