@@ -7,6 +7,7 @@
 import type { DeviceNode } from '../../shared/types'
 import type { ProtocolHandle } from './registry'
 import { applyWriteback } from '../engine/signals'
+import { saveConfig } from '../store'
 
 const DATA_TYPE_MAP: Record<string, string> = {
   Double: 'Double', Float: 'Float', Int16: 'Int16', UInt16: 'UInt16', Int32: 'Int32', UInt32: 'UInt32', Boolean: 'Boolean',
@@ -71,6 +72,10 @@ export async function startOpcUa(node: DeviceNode): Promise<ProtocolHandle> {
       // 自己刷新的值与 runtime.value 相同 → 忽略;不同 → 外部写,回灌
       if (typeof incoming === 'number' && Math.abs(incoming - sig.runtime.value) > 1e-9) {
         applyWriteback(sig, incoming)
+        // External PLC writes are part of the simulator's durable field state.
+        // Persist the setpoint strategy so a simulator restart cannot roll the
+        // protocol node back to its stale blueprint value.
+        saveConfig()
       }
     })
   }

@@ -7,6 +7,7 @@
 import type { DeviceNode } from '../../shared/types'
 import type { ProtocolHandle } from './registry'
 import { applyWriteback } from '../engine/signals'
+import { saveConfig } from '../store'
 
 function renderPayload(template: string | undefined, value: number): string {
   if (!template || template === '${value}') return String(value)
@@ -64,6 +65,9 @@ export async function startMqtt(node: DeviceNode): Promise<ProtocolHandle> {
       const sig = (node.signals ?? []).find(s => s.id === targetId)
       if (!sig) return
       applyWriteback(sig, value)
+      // Persist commandTopic writes so the next simulator process starts from
+      // the last PLC setpoint instead of the stale preset value.
+      saveConfig()
       node.runtime = { ...node.runtime, lastCommand: { at: Date.now(), value } } as never
     })
   }

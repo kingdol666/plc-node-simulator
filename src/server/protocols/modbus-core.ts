@@ -10,6 +10,7 @@ import type { DeviceNode, RegisterMap } from '../../shared/types'
 import { encodeRegisters, decodeRegisters, registerOffset, WORDS_OF } from '../engine/registers'
 import { applyWriteback } from '../engine/signals'
 import { broadcast } from '../bus'
+import { saveConfig } from '../store'
 
 export interface RegisterSpace {
   /** 读一个 word(area=holding/input,offset 协议偏移) */
@@ -66,6 +67,8 @@ export function createRegisterSpace(node: DeviceNode): RegisterSpace {
     const raw = decodeRegisters(pair, m.dataType, m.byteOrder)
     const out = raw * (sig.scale ?? 1) + (sig.offset ?? 0)
     applyWriteback(sig, out)
+    // Persist externally written setpoints; runtime-only PV ticks remain in-memory.
+    saveConfig()
     // SP→PV 联动:写 SP 地址同步更新目标回路的过程目标(真实 PLC 控制语义)
     if (m.writebackTarget) {
       const target = (node.signals ?? []).find(s => s.id === m.writebackTarget)

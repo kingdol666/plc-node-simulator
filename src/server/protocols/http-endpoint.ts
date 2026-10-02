@@ -11,6 +11,7 @@
 import type { DeviceNode } from '../../shared/types'
 import type { ProtocolHandle } from './registry'
 import { applyWriteback } from '../engine/signals'
+import { saveConfig } from '../store'
 
 const routes = new Map<string, DeviceNode>()
 
@@ -76,6 +77,8 @@ export function writeHttpControl(deviceId: string, path: string, rawBody: string
   catch { value = Number(rawBody.trim()) }
   if (!Number.isFinite(value)) return { status: 400, body: 'value must be numeric', contentType: 'text' }
   applyWriteback(sig, value)
+  // HTTP writable endpoints are real control inputs; persist their setpoint.
+  saveConfig()
   return { status: 200, body: JSON.stringify({ ok: true, value: sig.runtime?.value ?? value }), contentType: 'json' }
 }
 
