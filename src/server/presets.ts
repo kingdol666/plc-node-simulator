@@ -218,6 +218,7 @@ export function castFilmParts(): { nodes: DeviceNode[], plantModel: PlantModelCo
       ],
       commandTopic: 'aw/sim/lineSp/set',
       commandSignalId: 'linespeed-sp',
+      stateTopic: 'aw/sim/lineSp/state',
     } as never,
   }
 
@@ -673,6 +674,7 @@ export function filmLinePreset(): DeviceNode[] {
         ],
         commandTopic: 'aw/sim/setpoint',
         commandSignalId: 'mqtt-sp' as never,
+        stateTopic: 'aw/sim/state',
       },
     },
     {
@@ -832,6 +834,7 @@ export function injectionParts(): { nodes: DeviceNode[], plantModel: PlantModelC
       ],
       commandTopic: 'aw/inj/coolwater/set',
       commandSignalId: 'cool-water-sp',
+      stateTopic: 'aw/inj/coolwater/state',
     } as never,
   }
 
@@ -1013,6 +1016,7 @@ export function wwtpParts(): { nodes: DeviceNode[], plantModel: PlantModelConfig
       ],
       commandTopic: 'aw/wwtp/inflow/set',
       commandSignalId: 'influent-flow-sp',
+      stateTopic: 'aw/wwtp/inflow/state',
     } as never,
   }
 
@@ -1186,6 +1190,7 @@ export function annealParts(): { nodes: DeviceNode[], plantModel: PlantModelConf
       ],
       commandTopic: 'aw/anneal/h2/set',
       commandSignalId: 'h2-ratio-sp',
+      stateTopic: 'aw/anneal/h2/state',
     } as never,
   }
 

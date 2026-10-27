@@ -20,6 +20,9 @@ export async function startMqtt(node: DeviceNode): Promise<ProtocolHandle> {
   const topics = node.config.topics ?? []
   const commandTopic = node.config.commandTopic
   const commandSignalId = (node.config as Record<string, unknown>).commandSignalId as string | undefined
+  // 状态回显主题(可选):发布命令信号的当前值,供上位机/平台写后回读验证。
+  // retain=true → 上位机晚订阅也能立刻拿到当前设定值。
+  const stateTopic = (node.config as Record<string, unknown>).stateTopic as string | undefined
 
   const client = await mqtt.connectAsync(brokerUrl, {
     clientId: `plcsim-${node.id}-${Math.random().toString(16).slice(2, 6)}`,
@@ -43,10 +46,25 @@ export async function startMqtt(node: DeviceNode): Promise<ProtocolHandle> {
       const payload = renderPayload(t.payloadTemplate, sig.runtime.value)
       client.publish(t.topic, payload, { qos: t.qos ?? 0, retain: t.retain ?? false })
     }
+    if (stateTopic) {
+      const targetId = commandSignalId ?? topics[0]?.signalId
+      const sig = (node.signals ?? []).find(s => s.id === targetId)
+      if (sig?.runtime) {
+        const state = JSON.stringify({
+          setpoint: sig.runtime.value,
+          value: sig.runtime.value,
+          signalId: sig.id,
+          at: Date.now(),
+        })
+        client.publish(stateTopic, state, { qos: 0, retain: true })
+      }
+    }
   }
 
   // 发布周期 = 设备 tickMs(下限 500ms,避免打爆 broker)
   const timer = setInterval(publish, Math.max(node.tickMs, 500))
+  // 首拍立即发布一次:retained 值在设备启动后无需等一个 tick 即可被订阅者拿到
+  publish()
 
   // 命令回灌
   if (commandTopic) {
@@ -69,6 +87,8 @@ export async function startMqtt(node: DeviceNode): Promise<ProtocolHandle> {
       // the last PLC setpoint instead of the stale preset value.
       saveConfig()
       node.runtime = { ...node.runtime, lastCommand: { at: Date.now(), value } } as never
+      // 命令生效立即回显状态主题(不等下一个 tick):平台写后回读可在毫秒级拿到设定值
+      publish()
     })
   }
 
@@ -79,6 +99,7 @@ export async function startMqtt(node: DeviceNode): Promise<ProtocolHandle> {
     },
     summary: () => ({
       protocol: 'mqtt', brokerUrl, topics: topics.map(t => t.topic), commandTopic: commandTopic ?? null,
+      stateTopic: stateTopic ?? null,
       connected: client.connected, ...(lastError ? { lastError } : {}),
     }),
   }

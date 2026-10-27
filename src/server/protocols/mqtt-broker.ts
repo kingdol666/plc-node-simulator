@@ -11,6 +11,8 @@ type Publish = { topic: string, payload: Buffer, qos: 0 | 1, retain: boolean }
 type Sub = { topic: string, qos: 0 | 1, socket: net.Socket }
 
 const clients = new Map<net.Socket, { subs: Sub[], clientId: string }>()
+/** 保留消息(topic → 最后一条 retain 报文):上位机晚订阅也能立即拿到当前值 */
+const retained = new Map<string, Publish>()
 
 function topicMatch(pattern: string, topic: string): boolean {
   const p = pattern.split('/')
@@ -88,6 +90,11 @@ export async function startBroker(port = 18830, host = '127.0.0.1'): Promise<voi
             }
             // 先回确认(QoS1 必须 puback),再路由
             if (pub.qos > 0) sock.write(mqttPacket.generate({ cmd: 'puback', messageId: packet.messageId }))
+            // 保留消息:空载荷 = 清除该 topic 的保留值(MQTT 3.1.1 语义)
+            if (pub.retain) {
+              if (pub.payload.length === 0) retained.delete(pub.topic)
+              else retained.set(pub.topic, pub)
+            }
             deliver(pub, sock)
             break
           }
@@ -99,6 +106,17 @@ export async function startBroker(port = 18830, host = '127.0.0.1'): Promise<voi
               messageId: packet.messageId,
               granted: subs.map(() => 0),
             }))
+            // 保留消息补发:订阅建立后立即推送匹配的 retain 报文(上位机晚连也能拿到当前值)
+            for (const [topic, pub] of retained) {
+              if (!subs.some(s => topicMatch(s.topic, topic))) continue
+              sock.write(mqttPacket.generate({
+                cmd: 'publish',
+                topic,
+                payload: pub.payload,
+                qos: 0,
+                retain: true,
+              }))
+            }
             break
           }
           case 'unsubscribe': {
@@ -149,6 +167,7 @@ export async function stopBroker(): Promise<void> {
   if (!server) return
   for (const [sock] of clients) sock.destroy()
   clients.clear()
+  retained.clear()
   server.close(() => {})
   server = null
 }

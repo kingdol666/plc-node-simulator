@@ -449,9 +449,12 @@ function buildExport(node: NonNullable<ReturnType<typeof findNode>>) {
       // 修复动因:此前只遍历 topics(只读遥测),commandTopic 声明了却从不导出 →
       // cast-film 的 lineSpeedSP 拿不到驱动配置,该执行器在主项目侧"根本不存在"。
       if (cfg.commandTopic && cfg.commandSignalId === s.id) {
+        // stateTopic(可选):设备在状态主题回显设定值 → 平台写后回读(readback-verified)。
+        const stateTopic = (cfg as Record<string, unknown>).stateTopic as string | undefined
         push(s.name, 'mqtt', {
           host: '127.0.0.1', port: Number(new URL(cfg.brokerUrl ?? 'mqtt://127.0.0.1:18830').port ?? 1883),
           topic: cfg.commandTopic, jsonKey: 'setpoint',
+          ...(stateTopic ? { readTopic: stateTopic, readJsonPath: 'setpoint' } : {}),
         }, s.format, s)
         continue
       }
