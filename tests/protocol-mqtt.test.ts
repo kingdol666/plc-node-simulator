@@ -30,15 +30,38 @@ let json: { data?: { temp?: number } } | null = null
 try { json = JSON.parse(msg.payload) } catch { /* 非 JSON */ }
 check('收到设备发布 aw/sim/temp', msg.topic === 'aw/sim/temp' && typeof json?.data?.temp === 'number', msg.payload.slice(0, 40))
 
-// 2) 命令主题 → DCW 写语义回灌(tempSP manual 信号)
+// 2) 命令主题 → DCW 写语义回灌(tempSP manual 信号)+ 状态主题立即回显
 const before = dev.signals.find(s => s.id === 'mqtt-sp')?.value ?? 0
 const target = before >= 60 ? 55 : 62
+const states: Array<Record<string, unknown>> = []
+client.on('message', (topic, payload) => {
+  if (topic !== 'aw/sim/state') return
+  try { states.push(JSON.parse(payload.toString())) } catch { /* 忽略非 JSON */ }
+})
+await client.subscribeAsync('aw/sim/state', { qos: 1 })
 await client.publishAsync('aw/sim/setpoint', JSON.stringify({ setpoint: target }), { qos: 1 })
-await new Promise(r => setTimeout(r, 300))
+await new Promise(r => setTimeout(r, 600))
+const echo = states[states.length - 1] ?? {}
 const after2 = (await (await fetch('http://127.0.0.1:4010/api/nodes')).json()).data
   .find((n: { id: string }) => n.id === dev.id).signals
   .find((s: { id: string }) => s.id === 'mqtt-sp').value
 check('命令回灌 setpoint → tempSP', Math.abs(after2 - target) < 0.01, `write=${target} → value=${after2}`)
+check('命令生效 → 状态主题立即回显', Number(echo.setpoint) === target, JSON.stringify(echo).slice(0, 80))
+
+// 3) retained 状态:晚订阅的第二个客户端立即拿到当前值(不必等下一次发布)
+{
+  const late = await mqtt.connectAsync('mqtt://127.0.0.1:18830', { connectTimeout: 4000 })
+  let retained: Record<string, unknown> | null = null
+  const t0 = Date.now()
+  late.on('message', (topic, payload) => {
+    if (topic !== 'aw/sim/state') return
+    try { retained = JSON.parse(payload.toString()) } catch { retained = {} }
+  })
+  await late.subscribeAsync('aw/sim/state', { qos: 1 })
+  await new Promise(r => setTimeout(r, 1200))
+  check('状态主题 retained(晚订阅即时可取)', retained != null && Number.isFinite(Number((retained as Record<string, unknown>).setpoint)) && Date.now() - t0 < 1500, JSON.stringify(retained).slice(0, 80))
+  await late.endAsync()
+}
 
 await client.endAsync()
 console.log(`\nmqtt 自测: ${passed} passed / ${failed} failed`)
